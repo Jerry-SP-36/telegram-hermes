@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from telegram_bridge.response_handler import FORMAT_ERROR_MESSAGE, render_telegram_response
 from telegram_bridge.rewrite import rewrite_send_message_body
+from telegram_bridge.app import resolve_telegram_target
 
 
 def contract(response_type: str, summary: str, **overrides: object) -> str:
@@ -58,6 +59,13 @@ class ResponseHandlerTests(unittest.TestCase):
         body = json.dumps({"chat_id": 123, "text": contract("error", "失敗")}, ensure_ascii=False).encode()
         rewritten = rewrite_send_message_body(body, "application/json")
         self.assertEqual(json.loads(rewritten)["text"], "❌ 失敗")
+
+    def test_tokenless_bridge_accepts_only_valid_bot_api_paths(self) -> None:
+        target = resolve_telegram_target("/bot123456:bridge-test-token/sendMessage", None)
+        self.assertIsNotNone(target)
+        assert target is not None
+        self.assertEqual(target.method_name, "sendMessage")
+        self.assertIsNone(resolve_telegram_target("/botnot-a-token/sendMessage", None))
 
 
 if __name__ == "__main__":

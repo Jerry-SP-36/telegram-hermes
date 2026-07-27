@@ -28,23 +28,24 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
-METHOD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*\Z")
+BOT_API_PATH = re.compile(
+    r"/bot(?P<token>[0-9]+:[A-Za-z0-9_-]+)/(?P<method>[A-Za-z][A-Za-z0-9_]*)\Z"
+)
+BOT_FILE_PATH = re.compile(r"/file/bot(?P<token>[0-9]+:[A-Za-z0-9_-]+)/.+\Z")
 
 
 @dataclass(frozen=True)
 class Settings:
-    bot_token: str
+    allowed_bot_token: str | None
     telegram_origin: str
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
+        token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or None
         origin = os.environ.get("TELEGRAM_API_ORIGIN", DEFAULT_TELEGRAM_ORIGIN).rstrip("/")
         if not origin.startswith("https://"):
             raise RuntimeError("TELEGRAM_API_ORIGIN must be an HTTPS URL")
-        return cls(bot_token=token, telegram_origin=origin)
+        return cls(allowed_bot_token=token, telegram_origin=origin)
 
 
 @dataclass(frozen=True)
@@ -53,17 +54,24 @@ class TelegramTarget:
     method_name: str | None
 
 
-def resolve_telegram_target(path: str, token: str) -> TelegramTarget | None:
-    """Allow only configured-token Bot API or Bot API file paths."""
+def resolve_telegram_target(path: str, allowed_token: str | None) -> TelegramTarget | None:
+    """Allow Telegram Bot API paths, optionally pinning them to one bot token.
 
-    api_prefix = f"/bot{token}/"
-    file_prefix = f"/file/bot{token}/"
-    if path.startswith(api_prefix):
-        method_name = path[len(api_prefix) :]
-        if not METHOD_NAME.fullmatch(method_name):
+    Hermes already includes its bot token in each Bot API path.  Keeping the
+    bridge tokenless prevents duplicating that secret in a second service while
+    the service remains reachable only through Zeabur private networking.
+    """
+
+    api_match = BOT_API_PATH.fullmatch(path)
+    if api_match:
+        if allowed_token is not None and api_match.group("token") != allowed_token:
             return None
-        return TelegramTarget(upstream_path=path, method_name=method_name)
-    if path.startswith(file_prefix) and path[len(file_prefix) :]:
+        return TelegramTarget(upstream_path=path, method_name=api_match.group("method"))
+
+    file_match = BOT_FILE_PATH.fullmatch(path)
+    if file_match:
+        if allowed_token is not None and file_match.group("token") != allowed_token:
+            return None
         return TelegramTarget(upstream_path=path, method_name=None)
     return None
 
@@ -108,7 +116,7 @@ async def health() -> JSONResponse:
 async def proxy(request: Request, proxy_path: str):
     settings: Settings = request.app.state.settings
     path = f"/{proxy_path}"
-    target = resolve_telegram_target(path, settings.bot_token)
+    target = resolve_telegram_target(path, settings.allowed_bot_token)
     if target is None:
         raise HTTPException(status_code=404, detail="not found")
 

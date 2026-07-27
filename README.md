@@ -30,9 +30,12 @@ python3 -m unittest discover -s tests -v
 
 ## Zeabur deployment
 
-1. Create a new service from this directory's Dockerfile.  Add the environment
-   variable `TELEGRAM_BOT_TOKEN` with the **existing** bot token.  Do not put
-   the token in source code or logs.
+1. Create a new service from this directory's Dockerfile.  No Telegram token
+   variable is required: Hermes already includes its token in each Bot API
+   request path, and the bridge only accepts private-network traffic.  Do not
+   put the token in source code or logs.  If a deployment policy requires an
+   additional path check, set `TELEGRAM_BOT_TOKEN` to the existing token; this
+   is optional and must never be committed.
 2. Obtain the bridge service's private hostname from Zeabur's Networking page.
    It will be similar to `telegram-response-bridge.zeabur.internal`.
 3. Add the following to the active Hermes profile configuration, replacing the
@@ -65,9 +68,10 @@ or secrets.
 
 ## Security choices
 
-- The bridge accepts only paths containing its configured bot token and only
-  forwards them to `https://api.telegram.org` (or an explicitly configured
-  test origin).
+- The bridge accepts only well-formed Telegram Bot API paths and forwards them
+  only to `https://api.telegram.org` (or an explicitly configured test origin).
+  It runs on Zeabur private networking and does not store the bot token.  An
+  optional `TELEGRAM_BOT_TOKEN` pins accepted paths to one known token.
 - Uvicorn access logging is disabled so request URLs cannot reveal the bot
   token.
 - A `sendMessage` with free text, malformed JSON, or an invalid contract is
