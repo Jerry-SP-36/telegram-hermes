@@ -152,7 +152,11 @@ async def render_response(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
         raise HTTPException(status_code=400, detail="text must be a string")
-    logger.info("Telegram response render=%s", response_shape(payload["text"]))
+    shape = response_shape(payload["text"])
+    logger.info("Telegram response render=%s", shape)
+    # Uvicorn's production logging does not forward this module logger by
+    # default. Keep a content-free diagnostic available in Zeabur runtime logs.
+    print(f"Telegram response render={shape}", flush=True)
     return JSONResponse({"text": render_telegram_response(payload["text"])})
 
 
