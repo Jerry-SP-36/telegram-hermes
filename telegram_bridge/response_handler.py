@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 from collections.abc import Mapping
 from typing import Any
@@ -108,8 +109,10 @@ def _decode_response_object(raw_response: str) -> Any:
 
     The desired Hermes output is a bare JSON object.  This defensive decoder
     also accepts a JSON object wrapped in a Markdown fence or a short model
-    preamble, but only the parsed object reaches the normalizer.  A response
-    without a valid JSON object is still rejected.
+    preamble.  Some Telegram adapter paths stringify an already-decoded mapping
+    with Python's single-quoted repr; that exact mapping form is accepted only
+    after safe literal parsing, then the normal contract validation still
+    applies.  Free text and arbitrary expressions remain rejected.
     """
 
     content = raw_response.strip()
@@ -134,7 +137,17 @@ def _decode_response_object(raw_response: str) -> Any:
         except json.JSONDecodeError:
             continue
         return payload
-    raise ContractError("response does not contain a JSON object")
+
+    # A python-telegram-bot path can stringify an already-decoded response
+    # mapping as a single-quoted Python dict. literal_eval accepts only Python
+    # literals; the normalizer below still enforces the exact response contract.
+    try:
+        payload = ast.literal_eval(content)
+    except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
+        raise ContractError("response does not contain a response object") from exc
+    if not isinstance(payload, dict):
+        raise ContractError("response must be an object")
+    return payload
 
 
 def response_shape(raw_response: str) -> str:
