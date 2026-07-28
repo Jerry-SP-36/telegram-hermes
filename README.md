@@ -6,15 +6,14 @@ Telegram sender calls the bridge's private `/render` endpoint before using its
 existing sender, so only outgoing response text is transformed:
 
 ```text
-Telegram -> Hermes -> JSON response -> Response Bridge /render -> Telegram sender -> Telegram
+Telegram -> Hermes final reply -> Response Bridge /render -> Telegram sender -> Telegram
 ```
 
-Every `sendMessage` text must be a Hermes response JSON object.  The bridge
-extracts the one JSON object even when a model incorrectly wraps it in a code
-fence or short preamble, normalizes the safe legacy subset containing only
-`type` and `summary` into the full fixed contract, validates it, maps it to a
-short Telegram message, and never forwards the JSON or a malformed free-text
-response to the user.
+Contract JSON remains the preferred response format: the bridge extracts and
+validates it, then maps it to a concise Telegram message.  Built-in Hermes
+commands and general assistant replies may produce normal text instead, so the
+bridge now passes bounded plain text through safely. Empty or malformed
+JSON-like output still fails closed.
 
 ## Why this boundary
 
@@ -71,8 +70,10 @@ or secrets.
   optional `TELEGRAM_BOT_TOKEN` pins accepted paths to one known token.
 - Uvicorn access logging is disabled so request URLs cannot reveal the bot
   token.
-- A `sendMessage` with free text, malformed JSON, unknown fields, or an
-  invalid `type`/`summary` is replaced by `❌ 回覆格式錯誤，請再試一次。`; raw model output is never sent.  A JSON
-  object with only the safe `type` + `summary` subset is completed with fixed
-  defaults before rendering, so an LLM omission cannot break Telegram delivery.
+- A valid JSON contract is rendered with the expected status icon. Normal
+  Hermes final text has NUL characters removed and is bounded to 4,000
+  characters before delivery. Empty or malformed JSON-like output is replaced
+  by `❌ 回覆格式錯誤，請再試一次。`.
+- A JSON object with only the safe `type` + `summary` subset is completed with
+  fixed defaults before rendering, so an LLM omission cannot break delivery.
 - All other Telegram Bot API calls are passed through unchanged.
