@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -15,6 +16,44 @@ ALLOWED_TYPES = frozenset({"success", "question", "confirm", "error", "progress"
 REQUIRED_FIELDS = frozenset(
     {"version", "type", "action", "title", "summary", "confidence", "data", "actions"}
 )
+DISPLAY_FIELD_ORDER = (
+    "amount",
+    "category",
+    "subcategory",
+    "payment_method",
+    "merchant",
+    "item",
+    "due_date",
+    "date",
+    "for_who",
+    "note",
+)
+DISPLAY_FIELD_LABELS = {
+    "amount": "金額",
+    "category": "分類",
+    "subcategory": "子分類",
+    "payment_method": "付款方式",
+    "merchant": "商家",
+    "item": "項目",
+    "due_date": "期限",
+    "date": "日期",
+    "for_who": "對象",
+    "note": "備註",
+}
+CURRENCY_SYMBOLS = {
+    "TWD": "NT$",
+    "NTD": "NT$",
+    "NT$": "NT$",
+    "USD": "US$",
+    "JPY": "¥",
+    "EUR": "€",
+}
+SELF_IMPROVEMENT_PATCH = re.compile(
+    r"^💾\s*Self-improvement review:\s*Patched SKILL\.md in skill "
+    r"'(?P<skill>[^']+)' \((?P<count>\d+) replacements?\)\.?$",
+    re.IGNORECASE,
+)
+SELF_IMPROVEMENT_PREFIX = "💾 Self-improvement review:"
 
 
 class ContractError(ValueError):
@@ -179,12 +218,74 @@ def _looks_like_structured_response(content: str) -> bool:
     return content.lstrip().lower().startswith(STRUCTURED_PREFIXES)
 
 
+def _render_number(value: int | float) -> str:
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return f"{value:,}"
+
+
+def _render_amount(value: Any, currency: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    amount = value.strip() if isinstance(value, str) else _render_number(value)
+    if not amount:
+        return None
+    if not isinstance(currency, str) or not currency.strip():
+        return amount
+    symbol = CURRENCY_SYMBOLS.get(currency.strip().upper(), currency.strip().upper() + " ")
+    if amount.upper().startswith((symbol.upper(), currency.strip().upper())):
+        return amount
+    return f"{symbol}{amount}"
+
+
+def _render_data_lines(data: Mapping[str, Any]) -> list[str]:
+    """Render only approved user-facing fields; never expose internal state."""
+
+    lines: list[str] = []
+    for field in DISPLAY_FIELD_ORDER:
+        if field not in data:
+            continue
+        value = data[field]
+        if field == "amount":
+            display_value = _render_amount(value, data.get("currency"))
+        elif isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            display_value = None
+        else:
+            display_value = value.strip() if isinstance(value, str) else _render_number(value)
+        if display_value in (None, ""):
+            continue
+        lines.append(f"{DISPLAY_FIELD_LABELS[field]}：{display_value}")
+    return lines
+
+
+def _render_self_improvement_notification(content: str) -> str | None:
+    match = SELF_IMPROVEMENT_PATCH.fullmatch(content)
+    if match is not None:
+        return (
+            "🧠 Hermes 自我改善\n\n"
+            f"已更新技能：{match.group('skill')}\n"
+            f"變更：{match.group('count')} 處"
+        )
+    if content.startswith(SELF_IMPROVEMENT_PREFIX) and "Staged for approval" in content:
+        return (
+            "🛡️ 技能修改等待審核\n\n"
+            "Hermes 尚未套用這次變更。\n"
+            "輸入 /skills pending 查看。"
+        )
+    if content == f"{SELF_IMPROVEMENT_PREFIX} Memory updated":
+        return "🧠 Hermes 記憶已更新"
+    return None
+
+
 def _render_plain_text_response(raw_response: str) -> str:
     """Return a bounded Hermes final message while rejecting broken JSON-like output."""
 
     content = raw_response.replace("\x00", "").strip()
     if not content or _looks_like_structured_response(content):
         return FORMAT_ERROR_MESSAGE
+    self_improvement = _render_self_improvement_notification(content)
+    if self_improvement is not None:
+        return self_improvement
     if len(content) > MAX_PLAIN_TEXT_LENGTH:
         return f"{content[: MAX_PLAIN_TEXT_LENGTH - 1].rstrip()}…"
     return content
@@ -237,12 +338,14 @@ def render_telegram_response(raw_response: str) -> str:
 
     response_type = response["type"]
     summary = response["summary"].strip()
+    details = _render_data_lines(response["data"])
+    body = summary if not details else f"{summary}\n\n" + "\n".join(details)
     if response_type == "success":
-        return f"✅ {summary}"
+        return f"✅ {body}"
     if response_type == "question":
-        return f"❓ {summary}"
+        return f"❓ {body}"
     if response_type == "confirm":
-        return f"⚠️ {response['title'].strip()}\n\n{summary}"
+        return f"⚠️ {response['title'].strip()}\n\n{body}"
     if response_type == "progress":
-        return f"⏳ {summary}"
-    return f"❌ {summary}"
+        return f"⏳ {body}"
+    return f"❌ {body}"

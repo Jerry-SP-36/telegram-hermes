@@ -32,6 +32,42 @@ class ResponseHandlerTests(unittest.TestCase):
     def test_success(self) -> None:
         self.assertEqual(render_telegram_response(contract("success", "已完成整理。")), "✅ 已完成整理。")
 
+    def test_expense_success_renders_user_facing_details(self) -> None:
+        self.assertEqual(
+            render_telegram_response(
+                contract(
+                    "success",
+                    "已記錄支出",
+                    action="expense_created",
+                    data={
+                        "amount": 120,
+                        "currency": "TWD",
+                        "category": "餐飲",
+                        "payment_method": "信用卡",
+                        "ledger_id": "internal-id-must-not-leak",
+                        "duplicate": False,
+                    },
+                )
+            ),
+            "✅ 已記錄支出\n\n金額：NT$120\n分類：餐飲\n付款方式：信用卡",
+        )
+
+    def test_todo_success_skips_empty_and_internal_fields(self) -> None:
+        self.assertEqual(
+            render_telegram_response(
+                contract(
+                    "success",
+                    "已記錄待辦",
+                    data={
+                        "item": "要記得拿大頭照",
+                        "due_date": None,
+                        "event_appended": True,
+                    },
+                )
+            ),
+            "✅ 已記錄待辦\n\n項目：要記得拿大頭照",
+        )
+
     def test_question(self) -> None:
         self.assertEqual(render_telegram_response(contract("question", "要套用到哪個專案？")), "❓ 要套用到哪個專案？")
 
@@ -49,6 +85,27 @@ class ResponseHandlerTests(unittest.TestCase):
         self.assertEqual(render_telegram_response("✅ 已經整理完成"), "✅ 已經整理完成")
         self.assertEqual(render_telegram_response('{"type":"success"}'), FORMAT_ERROR_MESSAGE)
         self.assertEqual(render_telegram_response("{broken"), FORMAT_ERROR_MESSAGE)
+
+    def test_self_improvement_notification_is_rendered_in_readable_chinese(self) -> None:
+        self.assertEqual(
+            render_telegram_response(
+                "💾 Self-improvement review: Patched SKILL.md in skill "
+                "'expense-capture' (1 replacement)."
+            ),
+            "🧠 Hermes 自我改善\n\n已更新技能：expense-capture\n變更：1 處",
+        )
+        self.assertEqual(
+            render_telegram_response(
+                "💾 Self-improvement review: Staged for approval "
+                "(skills.write_approval is on). Pending id: skill-123."
+            ),
+            "🛡️ 技能修改等待審核\n\nHermes 尚未套用這次變更。\n"
+            "輸入 /skills pending 查看。",
+        )
+        self.assertEqual(
+            render_telegram_response("💾 Self-improvement review: Memory updated"),
+            "🧠 Hermes 記憶已更新",
+        )
 
     def test_plain_text_is_sanitized_and_bounded_for_telegram(self) -> None:
         self.assertEqual(render_telegram_response("A\x00B"), "AB")
