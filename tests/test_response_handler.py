@@ -44,9 +44,15 @@ class ResponseHandlerTests(unittest.TestCase):
             "⚠️ 部署確認\n\n是否繼續部署？",
         )
 
-    def test_invalid_or_free_text_never_leaks(self) -> None:
-        self.assertEqual(render_telegram_response("這是自由文字"), FORMAT_ERROR_MESSAGE)
+    def test_plain_text_passes_through_but_broken_json_stays_fail_closed(self) -> None:
+        self.assertEqual(render_telegram_response("這是自由文字"), "這是自由文字")
+        self.assertEqual(render_telegram_response("✅ 已經整理完成"), "✅ 已經整理完成")
         self.assertEqual(render_telegram_response('{"type":"success"}'), FORMAT_ERROR_MESSAGE)
+        self.assertEqual(render_telegram_response("{broken"), FORMAT_ERROR_MESSAGE)
+
+    def test_plain_text_is_sanitized_and_bounded_for_telegram(self) -> None:
+        self.assertEqual(render_telegram_response("A\x00B"), "AB")
+        self.assertEqual(render_telegram_response("x" * 4001), "x" * 3999 + "…")
 
     def test_partial_json_is_normalized_before_rendering(self) -> None:
         self.assertEqual(
@@ -96,7 +102,7 @@ class ResponseHandlerTests(unittest.TestCase):
 
     def test_response_shape_contains_no_message_content(self) -> None:
         self.assertEqual(response_shape('{"type":"success","summary":"成功測試"}'), "json keys=summary,type")
-        self.assertEqual(response_shape("自由文字"), "non_json chars=4 fence=False brace=False")
+        self.assertEqual(response_shape("自由文字"), "plain_text chars=4 fence=False brace=False")
 
     def test_form_send_message_is_rewritten(self) -> None:
         body = f"chat_id=123&text={contract('success', '完成')}&disable_notification=true".encode()
