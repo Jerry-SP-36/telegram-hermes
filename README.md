@@ -8,9 +8,10 @@ The bridge only rewrites outgoing `sendMessage` text:
 Hermes Telegram adapter -> Response Bridge -> Telegram Bot API
 ```
 
-Every `sendMessage` text must be a valid Hermes response JSON object.  The
-bridge validates it, maps it to a short Telegram message, and never forwards
-the JSON or a malformed free-text response to the user.
+Every `sendMessage` text must be a Hermes response JSON object.  The bridge
+normalizes the safe legacy subset containing only `type` and `summary` into the
+full fixed contract, validates it, maps it to a short Telegram message, and
+never forwards the JSON or a malformed free-text response to the user.
 
 ## Why this boundary
 
@@ -74,6 +75,8 @@ or secrets.
   optional `TELEGRAM_BOT_TOKEN` pins accepted paths to one known token.
 - Uvicorn access logging is disabled so request URLs cannot reveal the bot
   token.
-- A `sendMessage` with free text, malformed JSON, or an invalid contract is
-  replaced by `❌ 回覆格式錯誤，請再試一次。`; raw model output is never sent.
+- A `sendMessage` with free text, malformed JSON, unknown fields, or an
+  invalid `type`/`summary` is replaced by `❌ 回覆格式錯誤，請再試一次。`; raw model output is never sent.  A JSON
+  object with only the safe `type` + `summary` subset is completed with fixed
+  defaults before rendering, so an LLM omission cannot break Telegram delivery.
 - All other Telegram Bot API calls are passed through unchanged.

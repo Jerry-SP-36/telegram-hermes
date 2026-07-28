@@ -60,6 +60,49 @@ def validate_response(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def normalize_response(payload: Any) -> dict[str, Any]:
+    """Return the canonical contract, repairing a safe legacy subset.
+
+    Hermes is instructed to emit every contract field.  In practice, an LLM can
+    occasionally omit fields whose values are not shown in Telegram (for
+    example ``action`` or ``data``).  We accept only the safe JSON subset of
+    ``type`` and ``summary`` with no unknown fields, fill the fixed defaults,
+    and validate the resulting canonical object.  Free text, malformed JSON,
+    unknown fields, and invalid field types remain fail-closed.
+    """
+
+    if not isinstance(payload, dict):
+        raise ContractError("response must be an object")
+    if not set(payload).issubset(REQUIRED_FIELDS):
+        raise ContractError("response contains unknown fields")
+    if "type" not in payload or "summary" not in payload:
+        raise ContractError("response must include type and summary")
+
+    response_type = _require_string(payload, "type")
+    summary = _require_string(payload, "summary")
+    if response_type not in ALLOWED_TYPES or not summary.strip():
+        raise ContractError("response type or summary is invalid")
+
+    version = payload.get("version", "1.0")
+    action = payload.get("action", "")
+    title = payload.get("title", "需要確認" if response_type == "confirm" else "")
+    confidence = payload.get("confidence", 0.0)
+    data = payload.get("data", {})
+    actions = payload.get("actions", [])
+
+    response = {
+        "version": version,
+        "type": response_type,
+        "action": action,
+        "title": title,
+        "summary": summary,
+        "confidence": confidence,
+        "data": data,
+        "actions": actions,
+    }
+    return validate_response(response)
+
+
 def render_telegram_response(raw_response: str) -> str:
     """Convert a contract JSON string to a Telegram message.
 
@@ -69,7 +112,7 @@ def render_telegram_response(raw_response: str) -> str:
 
     try:
         payload = json.loads(raw_response)
-        response = validate_response(payload)
+        response = normalize_response(payload)
     except (json.JSONDecodeError, ContractError, TypeError):
         return FORMAT_ERROR_MESSAGE
 

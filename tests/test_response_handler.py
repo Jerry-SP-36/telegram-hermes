@@ -48,6 +48,20 @@ class ResponseHandlerTests(unittest.TestCase):
         self.assertEqual(render_telegram_response("這是自由文字"), FORMAT_ERROR_MESSAGE)
         self.assertEqual(render_telegram_response('{"type":"success"}'), FORMAT_ERROR_MESSAGE)
 
+    def test_partial_json_is_normalized_before_rendering(self) -> None:
+        self.assertEqual(
+            render_telegram_response('{"type":"success","summary":"成功測試"}'),
+            "✅ 成功測試",
+        )
+        self.assertEqual(
+            render_telegram_response('{"type":"confirm","summary":"是否繼續？"}'),
+            "⚠️ 需要確認\n\n是否繼續？",
+        )
+        self.assertEqual(
+            render_telegram_response('{"type":"success","summary":"完成","unexpected":true}'),
+            FORMAT_ERROR_MESSAGE,
+        )
+
     def test_form_send_message_is_rewritten(self) -> None:
         body = f"chat_id=123&text={contract('success', '完成')}&disable_notification=true".encode()
         rewritten = rewrite_send_message_body(body, "application/x-www-form-urlencoded")
