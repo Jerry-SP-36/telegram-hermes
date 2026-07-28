@@ -62,6 +62,17 @@ class ResponseHandlerTests(unittest.TestCase):
             FORMAT_ERROR_MESSAGE,
         )
 
+    def test_json_wrapped_by_model_text_is_safely_extracted(self) -> None:
+        partial = '{"type":"success","summary":"成功測試"}'
+        self.assertEqual(
+            render_telegram_response(f"```json\n{partial}\n```"),
+            "✅ 成功測試",
+        )
+        self.assertEqual(
+            render_telegram_response(f"以下是結果：\n{partial}\n請查收。"),
+            "✅ 成功測試",
+        )
+
     def test_form_send_message_is_rewritten(self) -> None:
         body = f"chat_id=123&text={contract('success', '完成')}&disable_notification=true".encode()
         rewritten = rewrite_send_message_body(body, "application/x-www-form-urlencoded")

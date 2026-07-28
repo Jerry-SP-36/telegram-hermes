@@ -103,6 +103,40 @@ def normalize_response(payload: Any) -> dict[str, Any]:
     return validate_response(response)
 
 
+def _decode_response_object(raw_response: str) -> Any:
+    """Decode the first JSON object without ever forwarding surrounding text.
+
+    The desired Hermes output is a bare JSON object.  This defensive decoder
+    also accepts a JSON object wrapped in a Markdown fence or a short model
+    preamble, but only the parsed object reaches the normalizer.  A response
+    without a valid JSON object is still rejected.
+    """
+
+    content = raw_response.strip()
+    if content.startswith("```"):
+        first_newline = content.find("\n")
+        if first_newline != -1:
+            content = content[first_newline + 1 :]
+        if content.rstrip().endswith("```"):
+            content = content.rstrip()[:-3].rstrip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(content):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
+        return payload
+    raise ContractError("response does not contain a JSON object")
+
+
 def render_telegram_response(raw_response: str) -> str:
     """Convert a contract JSON string to a Telegram message.
 
@@ -111,7 +145,7 @@ def render_telegram_response(raw_response: str) -> str:
     """
 
     try:
-        payload = json.loads(raw_response)
+        payload = _decode_response_object(raw_response)
         response = normalize_response(payload)
     except (json.JSONDecodeError, ContractError, TypeError):
         return FORMAT_ERROR_MESSAGE

@@ -9,9 +9,11 @@ Hermes Telegram adapter -> Response Bridge -> Telegram Bot API
 ```
 
 Every `sendMessage` text must be a Hermes response JSON object.  The bridge
-normalizes the safe legacy subset containing only `type` and `summary` into the
-full fixed contract, validates it, maps it to a short Telegram message, and
-never forwards the JSON or a malformed free-text response to the user.
+extracts the one JSON object even when a model incorrectly wraps it in a code
+fence or short preamble, normalizes the safe legacy subset containing only
+`type` and `summary` into the full fixed contract, validates it, maps it to a
+short Telegram message, and never forwards the JSON or a malformed free-text
+response to the user.
 
 ## Why this boundary
 
