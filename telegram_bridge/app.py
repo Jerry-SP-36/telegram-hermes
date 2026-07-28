@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
-from .response_handler import response_shape
+from .response_handler import render_telegram_response, response_shape
 from .rewrite import rewrite_send_message_body
 
 
@@ -136,6 +136,23 @@ app = FastAPI(title="Telegram Response Bridge", docs_url=None, redoc_url=None, l
 @app.get("/health")
 async def health() -> JSONResponse:
     return JSONResponse({"status": "ok"})
+
+
+@app.post("/render")
+async def render_response(request: Request) -> JSONResponse:
+    """Render one Hermes final response for the Telegram sender hook.
+
+    The service is reachable only on Zeabur private networking. It accepts only
+    response text, never persists it, and does not call Telegram itself.
+    """
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+        raise HTTPException(status_code=400, detail="text must be a string")
+    return JSONResponse({"text": render_telegram_response(payload["text"])})
 
 
 @app.api_route("/{proxy_path:path}", methods=["GET", "POST"])

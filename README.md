@@ -1,11 +1,12 @@
 # Telegram Response Bridge
 
-This service is a transparent Telegram Bot API proxy for Hermes.  Hermes keeps
-its existing Telegram adapter, polling, media handling, sessions, and tools.
-The bridge only rewrites outgoing `sendMessage` text:
+This service owns the response-rendering boundary for Hermes. Hermes keeps its
+existing Telegram adapter, polling, media handling, sessions, and tools. Its
+Telegram sender calls the bridge's private `/render` endpoint before sending a
+reply, so only outgoing response text is transformed:
 
 ```text
-Hermes Telegram adapter -> Response Bridge -> Telegram Bot API
+Hermes Telegram sender -> Response Bridge -> Telegram Bot API
 ```
 
 Every `sendMessage` text must be a Hermes response JSON object.  The bridge
@@ -17,10 +18,10 @@ response to the user.
 
 ## Why this boundary
 
-Hermes already supports a Telegram `base_url`.  Pointing that setting to this
-service lets the bridge proxy *all* Bot API calls, including `getUpdates` and
-file downloads.  This preserves the working inbound path instead of replacing
-it with a new webhook implementation.
+The bridge retains a restricted Bot API proxy route as a compatibility fallback
+for Hermes versions that honour a custom Telegram `base_url`. The primary path
+uses `/render`, which preserves the working inbound path and changes only the
+last Telegram-sender step.
 
 The bridge has no database, queue, state machine, callback routing, or
 confidence-based routing.

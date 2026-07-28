@@ -49,6 +49,16 @@ class FakeTelegramClient:
 
 
 class BridgeAppTests(unittest.TestCase):
+    def test_render_endpoint_uses_response_handler(self) -> None:
+        client = TestClient(app)
+        client.__enter__()
+        try:
+            response = client.post("/render", json={"text": contract("測試完成")})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"text": "✅ 測試完成"})
+        finally:
+            client.__exit__(None, None, None)
+
     def test_send_message_is_rewritten_before_forwarding(self) -> None:
         fake = FakeTelegramClient()
         client = TestClient(app)
