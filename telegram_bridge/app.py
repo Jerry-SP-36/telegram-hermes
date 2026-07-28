@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from urllib.parse import parse_qsl
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
+from .response_handler import response_shape
 from .rewrite import rewrite_send_message_body
 
 
@@ -32,6 +37,7 @@ BOT_API_PATH = re.compile(
     r"/bot(?P<token>[0-9]+:[A-Za-z0-9_-]+)/(?P<method>[A-Za-z][A-Za-z0-9_]*)\Z"
 )
 BOT_FILE_PATH = re.compile(r"/file/bot(?P<token>[0-9]+:[A-Za-z0-9_-]+)/.+\Z")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,6 +98,26 @@ def _response_headers(response: httpx.Response) -> dict[str, str]:
     }
 
 
+def _send_message_diagnostic(body: bytes, content_type: str | None) -> tuple[str, str] | None:
+    """Return a hashed chat ID and response shape without retaining content."""
+
+    media_type = (content_type or "").split(";", 1)[0].strip().lower()
+    try:
+        if media_type == "application/json":
+            fields = json.loads(body.decode("utf-8"))
+        elif media_type == "application/x-www-form-urlencoded":
+            fields = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
+        else:
+            return None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(fields, dict) or not isinstance(fields.get("text"), str):
+        return None
+    chat_id = str(fields.get("chat_id", ""))
+    chat_hash = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()[:12]
+    return chat_hash, response_shape(fields["text"])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = Settings.from_environment()
@@ -122,6 +148,10 @@ async def proxy(request: Request, proxy_path: str):
 
     body = await request.body()
     if target.method_name == "sendMessage":
+        diagnostic = _send_message_diagnostic(body, request.headers.get("content-type"))
+        if diagnostic is not None:
+            chat_hash, shape = diagnostic
+            logger.info("Telegram sendMessage chat=%s response=%s", chat_hash, shape)
         body = rewrite_send_message_body(body, request.headers.get("content-type"))
 
     upstream_url = f"{settings.telegram_origin}{target.upstream_path}"

@@ -137,6 +137,24 @@ def _decode_response_object(raw_response: str) -> Any:
     raise ContractError("response does not contain a JSON object")
 
 
+def response_shape(raw_response: str) -> str:
+    """Return non-content diagnostics suitable for a private service log."""
+
+    content = raw_response.strip()
+    try:
+        payload = _decode_response_object(raw_response)
+    except ContractError:
+        return (
+            "non_json"
+            f" chars={len(content)}"
+            f" fence={content.startswith('```')}"
+            f" brace={'{' in content}"
+        )
+    if isinstance(payload, dict):
+        return f"json keys={','.join(sorted(str(key) for key in payload))}"
+    return f"json_{type(payload).__name__}"
+
+
 def render_telegram_response(raw_response: str) -> str:
     """Convert a contract JSON string to a Telegram message.
 

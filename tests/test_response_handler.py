@@ -8,7 +8,7 @@ from urllib.parse import parse_qs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from telegram_bridge.response_handler import FORMAT_ERROR_MESSAGE, render_telegram_response
+from telegram_bridge.response_handler import FORMAT_ERROR_MESSAGE, render_telegram_response, response_shape
 from telegram_bridge.rewrite import rewrite_send_message_body
 from telegram_bridge.app import resolve_telegram_target
 
@@ -72,6 +72,10 @@ class ResponseHandlerTests(unittest.TestCase):
             render_telegram_response(f"以下是結果：\n{partial}\n請查收。"),
             "✅ 成功測試",
         )
+
+    def test_response_shape_contains_no_message_content(self) -> None:
+        self.assertEqual(response_shape('{"type":"success","summary":"成功測試"}'), "json keys=summary,type")
+        self.assertEqual(response_shape("自由文字"), "non_json chars=4 fence=False brace=False")
 
     def test_form_send_message_is_rewritten(self) -> None:
         body = f"chat_id=123&text={contract('success', '完成')}&disable_notification=true".encode()
