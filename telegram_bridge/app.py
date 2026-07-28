@@ -152,6 +152,7 @@ async def render_response(request: Request) -> JSONResponse:
         raise HTTPException(status_code=400, detail="invalid JSON") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
         raise HTTPException(status_code=400, detail="text must be a string")
+    logger.info("Telegram response render=%s", response_shape(payload["text"]))
     return JSONResponse({"text": render_telegram_response(payload["text"])})
 
 
