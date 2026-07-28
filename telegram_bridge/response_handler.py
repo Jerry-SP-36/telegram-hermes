@@ -9,6 +9,8 @@ from typing import Any
 
 
 FORMAT_ERROR_MESSAGE = "❌ 回覆格式錯誤，請再試一次。"
+MAX_PLAIN_TEXT_LENGTH = 4000
+STRUCTURED_PREFIXES = ("{", "[", "```json")
 ALLOWED_TYPES = frozenset({"success", "question", "confirm", "error", "progress"})
 REQUIRED_FIELDS = frozenset(
     {"version", "type", "action", "title", "summary", "confidence", "data", "actions"}
@@ -128,6 +130,16 @@ def _decode_response_object(raw_response: str) -> Any:
     except json.JSONDecodeError:
         pass
 
+    # Try the full Python literal before scanning for embedded JSON. Otherwise
+    # an inner empty dict in a valid Python mapping can be mistaken for the
+    # complete response object.
+    try:
+        literal_payload = ast.literal_eval(content)
+    except (SyntaxError, ValueError, TypeError, RecursionError):
+        literal_payload = None
+    if isinstance(literal_payload, dict):
+        return literal_payload
+
     decoder = json.JSONDecoder()
     for index, char in enumerate(content):
         if char != "{":
@@ -137,17 +149,22 @@ def _decode_response_object(raw_response: str) -> Any:
         except json.JSONDecodeError:
             continue
         return payload
+    raise ContractError("response does not contain a response object")
 
-    # A python-telegram-bot path can stringify an already-decoded response
-    # mapping as a single-quoted Python dict. literal_eval accepts only Python
-    # literals; the normalizer below still enforces the exact response contract.
-    try:
-        payload = ast.literal_eval(content)
-    except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
-        raise ContractError("response does not contain a response object") from exc
-    if not isinstance(payload, dict):
-        raise ContractError("response must be an object")
-    return payload
+
+def _looks_like_structured_response(content: str) -> bool:
+    return content.lstrip().lower().startswith(STRUCTURED_PREFIXES)
+
+
+def _render_plain_text_response(raw_response: str) -> str:
+    """Return a bounded Hermes final message while rejecting broken JSON-like output."""
+
+    content = raw_response.replace("\x00", "").strip()
+    if not content or _looks_like_structured_response(content):
+        return FORMAT_ERROR_MESSAGE
+    if len(content) > MAX_PLAIN_TEXT_LENGTH:
+        return f"{content[: MAX_PLAIN_TEXT_LENGTH - 1].rstrip()}…"
+    return content
 
 
 def response_shape(raw_response: str) -> str:
@@ -157,11 +174,17 @@ def response_shape(raw_response: str) -> str:
     try:
         payload = _decode_response_object(raw_response)
     except ContractError:
+        if not content:
+            shape = "empty"
+        elif _looks_like_structured_response(content):
+            shape = "malformed_json"
+        else:
+            shape = "plain_text"
         return (
-            "non_json"
-            f" chars={len(content)}"
-            f" fence={content.startswith('```')}"
-            f" brace={'{' in content}"
+            shape
+            + f" chars={len(content)}"
+            + f" fence={content.startswith('```')}"
+            + f" brace={'{' in content}"
         )
     if isinstance(payload, dict):
         return f"json keys={','.join(sorted(str(key) for key in payload))}"
@@ -169,17 +192,19 @@ def response_shape(raw_response: str) -> str:
 
 
 def render_telegram_response(raw_response: str) -> str:
-    """Convert a contract JSON string to a Telegram message.
+    """Render contract JSON or safely pass through a normal Hermes final message.
 
-    Invalid content deliberately becomes a generic error.  This prevents a
-    model's free-form text or malformed JSON from being displayed to Telegram.
+    Valid response-contract objects keep the concise icon rendering. Ordinary
+    Hermes final text is bounded and delivered unchanged so built-in commands
+    and general replies do not fail merely because they are not JSON. Empty
+    and malformed JSON-like output remains fail-closed.
     """
 
     try:
         payload = _decode_response_object(raw_response)
         response = normalize_response(payload)
     except (json.JSONDecodeError, ContractError, TypeError):
-        return FORMAT_ERROR_MESSAGE
+        return _render_plain_text_response(raw_response)
 
     response_type = response["type"]
     summary = response["summary"].strip()
