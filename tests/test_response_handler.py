@@ -79,6 +79,28 @@ class ResponseHandlerTests(unittest.TestCase):
             "✅ 成功測試",
         )
 
+    def test_real_telegram_contract_repairs_optional_metadata_and_stays_readable(self) -> None:
+        payload = {
+            "version": "1.0",
+            "type": "success",
+            "action": "telegram_bridge_status",
+            "title": "",
+            "summary": "Telegram 橋接已連線",
+            "confidence": "1.0",
+            "data": {},
+            "actions": [],
+        }
+        self.assertEqual(
+            render_telegram_response(json.dumps(payload, ensure_ascii=False)),
+            "✅ Telegram 橋接已連線",
+        )
+        self.assertEqual(
+            render_telegram_response(
+                "以下是結果：\n" + json.dumps(payload, ensure_ascii=False)
+            ),
+            "✅ Telegram 橋接已連線",
+        )
+
     def test_python_mapping_repr_from_telegram_adapter_is_safely_normalized(self) -> None:
         payload = {
             "version": "1.0",
