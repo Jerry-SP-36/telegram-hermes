@@ -2,11 +2,11 @@
 
 This service owns the response-rendering boundary for Hermes. Hermes keeps its
 existing Telegram adapter, polling, media handling, sessions, and tools. Its
-Telegram sender calls the bridge's private `/render` endpoint before sending a
-reply, so only outgoing response text is transformed:
+Telegram sender calls the bridge's private `/render` endpoint before using its
+existing sender, so only outgoing response text is transformed:
 
 ```text
-Hermes Telegram sender -> Response Bridge -> Telegram Bot API
+Telegram -> Hermes -> JSON response -> Response Bridge /render -> Telegram sender -> Telegram
 ```
 
 Every `sendMessage` text must be a Hermes response JSON object.  The bridge
@@ -42,28 +42,21 @@ python3 -m unittest discover -s tests -v
    is optional and must never be committed.
 2. Obtain the bridge service's private hostname from Zeabur's Networking page.
    It will be similar to `telegram-response-bridge.zeabur.internal`.
-3. Add the following to the active Hermes profile configuration, replacing the
-   placeholder with that exact hostname.  Keep the existing Telegram token and
-   every other Telegram setting unchanged.
-
-   ```yaml
-   telegram:
-     extra:
-       base_url: http://<bridge-private-hostname>/bot
-       base_file_url: http://<bridge-private-hostname>/file/bot
-   ```
-
-   If the active profile already has `telegram.extra`, merge these two keys;
-   do not replace its other keys.
+3. Install [`hermes/telegram_response_sender.py`](hermes/telegram_response_sender.py)
+   as `sitecustomize.py` in the Hermes runtime Python path, changing
+   `RENDER_URL` to the exact private hostname.  Configure Hermes to load that
+   directory through `PYTHONPATH`.  The hook changes only replies that point
+   back to an incoming Telegram message; startup notices and inbound polling
+   remain untouched.
 4. Append the contents of
    [`hermes/AGENTS-telegram-json.md`](hermes/AGENTS-telegram-json.md) to the
    active Hermes workspace's existing `AGENTS.md`.  Do not replace unrelated
    workspace instructions.
 5. Restart Hermes once.  There must be only one Hermes Telegram poller for the
-   bot token.  The bridge proxies that poller; it does not poll Telegram itself.
-6. Test `success`, `question`, and `error` in a private Telegram chat.  If the
-   result is not correct, remove the two `base_url` settings and restart Hermes
-   to return to the original direct Telegram path.
+   bot token.  The bridge does not poll Telegram itself.
+6. Test `success`, `question`, and `error` in a private Telegram chat.  A
+   single reply must traverse the sender hook exactly once; do not patch both
+   `Bot.send_message` and `ExtBot.send_message`.
 
 ## Health check
 
