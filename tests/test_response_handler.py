@@ -73,6 +73,27 @@ class ResponseHandlerTests(unittest.TestCase):
             "✅ 成功測試",
         )
 
+    def test_python_mapping_repr_from_telegram_adapter_is_safely_normalized(self) -> None:
+        payload = {
+            "version": "1.0",
+            "type": "success",
+            "action": "",
+            "title": "Telegram 收件內容",
+            "summary": "已記錄 Telegram 測試內容。",
+            "confidence": 1.0,
+            "data": {
+                "memory_saved": True,
+                "event_appended": True,
+                "notion_synced": False,
+                "duplicate": False,
+            },
+            "actions": [],
+        }
+        self.assertEqual(
+            render_telegram_response(repr(payload)),
+            "✅ 已記錄 Telegram 測試內容。",
+        )
+
     def test_response_shape_contains_no_message_content(self) -> None:
         self.assertEqual(response_shape('{"type":"success","summary":"成功測試"}'), "json keys=summary,type")
         self.assertEqual(response_shape("自由文字"), "non_json chars=4 fence=False brace=False")
