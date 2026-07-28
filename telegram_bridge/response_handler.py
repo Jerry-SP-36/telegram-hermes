@@ -63,6 +63,21 @@ def validate_response(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def _coerce_confidence(value: Any) -> float:
+    """Return a safe display confidence without rejecting an otherwise valid reply."""
+
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return 0.0
+    if isinstance(value, (int, float)) and 0.0 <= value <= 1.0:
+        return float(value)
+    return 0.0
+
+
 def normalize_response(payload: Any) -> dict[str, Any]:
     """Return the canonical contract, repairing a safe legacy subset.
 
@@ -86,12 +101,20 @@ def normalize_response(payload: Any) -> dict[str, Any]:
     if response_type not in ALLOWED_TYPES or not summary.strip():
         raise ContractError("response type or summary is invalid")
 
-    version = payload.get("version", "1.0")
+    version = "1.0"
     action = payload.get("action", "")
+    if not isinstance(action, str):
+        action = ""
     title = payload.get("title", "需要確認" if response_type == "confirm" else "")
-    confidence = payload.get("confidence", 0.0)
+    if not isinstance(title, str) or (response_type == "confirm" and not title.strip()):
+        title = "需要確認" if response_type == "confirm" else ""
+    confidence = _coerce_confidence(payload.get("confidence", 0.0))
     data = payload.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
     actions = payload.get("actions", [])
+    if not isinstance(actions, list):
+        actions = []
 
     response = {
         "version": version,
@@ -202,9 +225,15 @@ def render_telegram_response(raw_response: str) -> str:
 
     try:
         payload = _decode_response_object(raw_response)
-        response = normalize_response(payload)
     except (json.JSONDecodeError, ContractError, TypeError):
         return _render_plain_text_response(raw_response)
+
+    # Once structured output was decoded, never leak it through the plain-text
+    # fallback. Repair safe optional metadata, or fail closed.
+    try:
+        response = normalize_response(payload)
+    except (ContractError, TypeError):
+        return FORMAT_ERROR_MESSAGE
 
     response_type = response["type"]
     summary = response["summary"].strip()
