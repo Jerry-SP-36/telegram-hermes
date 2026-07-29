@@ -55,11 +55,21 @@ def _allowed_chat_ids() -> set[str]:
 
     try:
         try:
-            from hermes.constants import get_hermes_home
+            from hermes_constants import get_hermes_home
 
             config_path = get_hermes_home() / "config.yaml"
         except ImportError:
-            config_path = Path.home() / ".hermes" / "config.yaml"
+            try:
+                from hermes.constants import get_hermes_home
+
+                config_path = get_hermes_home() / "config.yaml"
+            except ImportError:
+                configured_home = os.getenv("HERMES_HOME", "").strip()
+                config_path = (
+                    Path(configured_home) / "config.yaml"
+                    if configured_home
+                    else Path.home() / ".hermes" / "config.yaml"
+                )
         config_text = config_path.read_text(encoding="utf-8")
         try:
             import yaml

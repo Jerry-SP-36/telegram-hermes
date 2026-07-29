@@ -4,11 +4,12 @@ import asyncio
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from enum import Enum
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 
@@ -237,6 +238,22 @@ class TodoDirectIngestTests(unittest.TestCase):
             )
         self.assertIsNone(result)
         self.assertEqual(adapter.messages, [])
+
+    def test_allowed_chat_ids_uses_active_hermes_home(self) -> None:
+        config_path = Path(self.temp_dir.name) / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      channel_prompts:\n"
+            "        '42': Jerry private chat\n",
+            encoding="utf-8",
+        )
+        constants = ModuleType("hermes_constants")
+        constants.get_hermes_home = lambda: Path(self.temp_dir.name)
+        with patch.dict(os.environ, {"TODO_TELEGRAM_CHAT_ID": ""}, clear=False):
+            with patch.dict(sys.modules, {"hermes_constants": constants}):
+                self.assertEqual(todo._allowed_chat_ids(), {"42"})
 
     def test_registers_only_the_pre_dispatch_hook(self) -> None:
         calls = []
