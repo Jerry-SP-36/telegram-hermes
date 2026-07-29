@@ -29,6 +29,9 @@ DEFAULT_FOR_WHO = "Myself"
 _PREFIX_PATTERN = re.compile(
     r"^(?:待辦\s*[:：]|提醒我(?:要|去|一下)?|記住(?:要|去)?|要記得|加入任務\s*[:：]?)\s*(?P<item>.*)$"
 )
+_COMPLETION_PATTERN = re.compile(
+    r"^(?:(?:待辦|任務)\s*)?(?:我\s*)?(?:已)?完成(?:了)?(?:待辦|任務)?\s*[:：]?\s*(?P<item>.*)$"
+)
 _DATED_ACTION_PATTERN = re.compile(r"^(?:今天|明天)要\S.*$")
 _QUERY_PATTERN = re.compile(
     r"(?:今天|明天)?要做什麼|(?:有|有哪些|查看|查詢|列出|顯示).{0,8}待辦|待辦.{0,8}(?:有什麼|有哪些|清單|列表|進度|狀態)"
@@ -128,6 +131,21 @@ def _parse_todo_text(text: str) -> tuple[str, str | None] | None:
     if _DATED_ACTION_PATTERN.fullmatch(normalized):
         return normalized, _derive_due_date(normalized)
     return None
+
+
+def _parse_completion_text(text: str) -> str | None:
+    normalized = (text or "").strip()
+    if not normalized or normalized.startswith("/"):
+        return None
+    match = _COMPLETION_PATTERN.fullmatch(normalized)
+    if match is None:
+        return None
+    item = match.group("item").strip().strip("「」『』\"'")
+    if not item:
+        return ""
+    if "?" in item or "？" in item or _is_query(item):
+        return None
+    return item
 
 
 def _derive_due_date(text: str, today: dt.date | None = None) -> str | None:
@@ -284,21 +302,37 @@ def _notion_date_start(page: dict[str, Any], property_name: str) -> str | None:
     return start[:10] if isinstance(start, str) else None
 
 
-def _query_matching_todo(record: dict[str, Any]) -> bool:
-    results = _notion_request(
+def _notion_checkbox(page: dict[str, Any], property_name: str) -> bool | None:
+    properties = page.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    value = properties.get(property_name)
+    if not isinstance(value, dict):
+        return None
+    checked = value.get("checkbox")
+    return checked if isinstance(checked, bool) else None
+
+
+def _query_todos_by_item(item: str) -> list[dict[str, Any]]:
+    response = _notion_request(
         "POST",
         f"/v1/data_sources/{DATA_SOURCE_ID}/query",
         {
             "filter": {
                 "property": "Item",
-                "title": {"equals": record["item"]},
+                "title": {"equals": item},
             },
             "page_size": 100,
         },
-    ).get("results", [])
+    )
+    results = response.get("results", []) if isinstance(response, dict) else []
+    return [page for page in results if isinstance(page, dict)]
+
+
+def _query_matching_todo(record: dict[str, Any]) -> bool:
+    results = _query_todos_by_item(record["item"])
     return any(
-        isinstance(page, dict)
-        and _notion_select_name(page, "For Who") == record["for_who"]
+        _notion_select_name(page, "For Who") == record["for_who"]
         and _notion_date_start(page, "Due Date") == record.get("due_date")
         for page in results
     )
@@ -330,6 +364,35 @@ def _sync_to_notion(record: dict[str, Any]) -> str:
     return "created"
 
 
+def _todo_from_notion_page(item: str, page: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "item": item,
+        "due_date": _notion_date_start(page, "Due Date"),
+        "for_who": _notion_select_name(page, "For Who") or DEFAULT_FOR_WHO,
+    }
+
+
+def _complete_notion_todo(item: str) -> tuple[str, dict[str, Any] | None]:
+    pages = _query_todos_by_item(item)
+    incomplete = [page for page in pages if _notion_checkbox(page, "Done?") is not True]
+    if len(incomplete) > 1:
+        return "ambiguous", None
+    if len(incomplete) == 1:
+        page = incomplete[0]
+        page_id = page.get("id")
+        if not isinstance(page_id, str) or not page_id:
+            raise RuntimeError("Notion task page id is missing")
+        _notion_request(
+            "PATCH",
+            f"/v1/pages/{page_id}",
+            {"properties": {"Done?": {"checkbox": True}}},
+        )
+        return "completed", _todo_from_notion_page(item, page)
+    if pages:
+        return "already_completed", _todo_from_notion_page(item, pages[0])
+    return "not_found", None
+
+
 def _due_label(due_date: str | None, today: dt.date | None = None) -> str:
     if not due_date:
         return "未指定"
@@ -355,6 +418,40 @@ def _notion_warning_reply(record: dict[str, Any]) -> str:
         "⚠️ 待辦已保留在 Hermes，但尚未同步到 Notion\n\n"
         f"項目：{record['item']}\n"
         "稍後重試不會重複建立待辦。"
+    )
+
+
+def _completion_success_reply(record: dict[str, Any]) -> str:
+    return (
+        "✅ 待辦已完成並更新到 Notion\n\n"
+        f"項目：{record['item']}\n"
+        f"期限：{_due_label(record.get('due_date'))}\n"
+        f"對象：{record['for_who']}"
+    )
+
+
+def _completion_already_done_reply(record: dict[str, Any]) -> str:
+    return (
+        "✅ 待辦已是完成狀態\n\n"
+        f"項目：{record['item']}\n"
+        f"期限：{_due_label(record.get('due_date'))}\n"
+        f"對象：{record['for_who']}"
+    )
+
+
+def _completion_not_found_reply(item: str) -> str:
+    return (
+        "❓ 找不到尚未完成的待辦\n\n"
+        f"項目：{item}\n"
+        "請確認名稱是否和原待辦一致。"
+    )
+
+
+def _completion_ambiguous_reply(item: str) -> str:
+    return (
+        "❓ 找到多個同名的未完成待辦\n\n"
+        f"項目：{item}\n"
+        "請輸入完整的原待辦名稱後再完成。"
     )
 
 
@@ -391,7 +488,35 @@ def _intercept_todo(event: Any, gateway: Any, **kwargs: Any) -> dict[str, str] |
     if not allowed_chats.intersection((chat_id, user_id)):
         return None
 
-    parsed = _parse_todo_text(getattr(event, "text", ""))
+    text = getattr(event, "text", "")
+    completion_item = _parse_completion_text(text)
+    if completion_item is not None:
+        if not completion_item:
+            _schedule_reply(gateway, event, "❓ 請告訴我要完成哪一項待辦。")
+            return {"action": "skip", "reason": "todo-direct-completion-missing-item"}
+        try:
+            completion_state, completed = _complete_notion_todo(completion_item)
+        except Exception:
+            logger.exception("Todo completion could not update Notion")
+            _schedule_reply(
+                gateway,
+                event,
+                "❌ 待辦尚未更新\n\n原因：暫時無法更新 Notion，請稍後再試。",
+            )
+            return {"action": "skip", "reason": "todo-direct-completion-failed"}
+
+        if completion_state == "completed" and completed is not None:
+            reply = _completion_success_reply(completed)
+        elif completion_state == "already_completed" and completed is not None:
+            reply = _completion_already_done_reply(completed)
+        elif completion_state == "ambiguous":
+            reply = _completion_ambiguous_reply(completion_item)
+        else:
+            reply = _completion_not_found_reply(completion_item)
+        _schedule_reply(gateway, event, reply)
+        return {"action": "skip", "reason": "todo-direct-completion"}
+
+    parsed = _parse_todo_text(text)
     if parsed is None:
         return None
     item, due_date = parsed

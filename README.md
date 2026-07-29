@@ -42,6 +42,13 @@ This is deliberately separate from the response bridge. The bridge still owns
 only final-response rendering, while the existing `expense-direct-ingest`
 plugin and the single built-in Telegram poller remain unchanged.
 
+### Telegram 待辦指令
+
+- 建立待辦：`待辦：<內容>`、`要記得<內容>`、`今天要…`。
+- 完成待辦：`完成：<完整原待辦名稱>` 或 `已完成 <完整原待辦名稱>`。
+
+完成指令只會把唯一匹配的 Notion `Done?` 設為完成；同名未完成待辦超過一筆時不會猜測或更新。原始 `todo-inbox.jsonl` 保持 append-only，Notion 是待辦完成狀態的真相。
+
 ## Local verification
 
 ```sh

@@ -43,8 +43,25 @@ class FakeAdapter:
 class NotionStub:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
-        self.items: set[tuple[str, str | None, str]] = set()
+        self.pages: dict[str, dict[str, object]] = {}
         self.created = 0
+        self.updated = 0
+
+    def add_page(
+        self,
+        item: str,
+        due_date: str | None,
+        for_who: str,
+        done: bool = False,
+    ) -> str:
+        page_id = f"page-{len(self.pages) + 1}"
+        self.pages[page_id] = {
+            "item": item,
+            "due_date": due_date,
+            "for_who": for_who,
+            "done": done,
+        }
+        return page_id
 
     def __call__(self, method: str, path: str, payload=None):
         if self.fail:
@@ -52,17 +69,23 @@ class NotionStub:
         if path.endswith("/query"):
             item = payload["filter"]["title"]["equals"]
             results = []
-            for stored_item, due_date, for_who in self.items:
+            for page_id, page in self.pages.items():
+                stored_item = page["item"]
                 if stored_item != item:
                     continue
                 results.append(
                     {
-                        "id": "existing",
+                        "id": page_id,
                         "properties": {
-                            "For Who": {"select": {"name": for_who}},
+                            "For Who": {"select": {"name": page["for_who"]}},
                             "Due Date": {
-                                "date": None if due_date is None else {"start": due_date}
+                                "date": (
+                                    None
+                                    if page["due_date"] is None
+                                    else {"start": page["due_date"]}
+                                )
                             },
+                            "Done?": {"checkbox": page["done"]},
                         },
                     }
                 )
@@ -73,9 +96,14 @@ class NotionStub:
             due_property = properties.get("Due Date", {}).get("date")
             due_date = due_property.get("start") if due_property else None
             for_who = properties["For Who"]["select"]["name"]
-            self.items.add((item, due_date, for_who))
+            self.add_page(item, due_date, for_who)
             self.created += 1
             return {"url": "https://www.notion.so/test"}
+        if method == "PATCH" and path.startswith("/v1/pages/"):
+            page_id = path.rsplit("/", 1)[-1]
+            self.pages[page_id]["done"] = payload["properties"]["Done?"]["checkbox"]
+            self.updated += 1
+            return {"id": page_id}
         raise AssertionError(path)
 
 
@@ -202,6 +230,47 @@ class TodoDirectIngestTests(unittest.TestCase):
         self.assertEqual(len(self.records()), 2)
         self.assertEqual(notion.created, 2)
 
+    def test_clear_completion_updates_one_matching_notion_task(self) -> None:
+        notion = NotionStub()
+        item = "今天要詢問歐美亞有關護照申辦的事情"
+        page_id = notion.add_page(
+            item,
+            todo.dt.datetime.now(todo.TIMEZONE).date().isoformat(),
+            "Myself",
+        )
+        result, adapter = asyncio.run(self.run_hook(f"完成：{item}", notion, "400"))
+        self.assertEqual(result["reason"], "todo-direct-completion")
+        self.assertEqual(notion.updated, 1)
+        self.assertTrue(notion.pages[page_id]["done"])
+        self.assertEqual(self.records(), [])
+        self.assertIn("待辦已完成並更新到 Notion", adapter.messages[0][1])
+
+    def test_completion_is_idempotent_when_notion_is_already_done(self) -> None:
+        notion = NotionStub()
+        item = "拿大頭照"
+        page_id = notion.add_page(item, None, "Myself", done=True)
+        _, adapter = asyncio.run(self.run_hook(f"已完成 {item}", notion, "401"))
+        self.assertEqual(notion.updated, 0)
+        self.assertTrue(notion.pages[page_id]["done"])
+        self.assertIn("已是完成狀態", adapter.messages[0][1])
+
+    def test_completion_never_updates_ambiguous_or_missing_tasks(self) -> None:
+        notion = NotionStub()
+        notion.add_page("確認簡報", "2026-07-30", "Myself")
+        notion.add_page("確認簡報", "2026-07-31", "Myself")
+        _, ambiguous = asyncio.run(self.run_hook("完成：確認簡報", notion, "402"))
+        _, missing = asyncio.run(self.run_hook("完成：不存在的待辦", notion, "403"))
+        self.assertEqual(notion.updated, 0)
+        self.assertIn("多個同名", ambiguous.messages[0][1])
+        self.assertIn("找不到", missing.messages[0][1])
+
+    def test_completion_query_falls_through_without_updating_notion(self) -> None:
+        notion = NotionStub()
+        result, adapter = asyncio.run(self.run_hook("完成了什麼？", notion, "404"))
+        self.assertIsNone(result)
+        self.assertEqual(notion.updated, 0)
+        self.assertEqual(adapter.messages, [])
+
     def test_invalid_jsonl_fails_closed(self) -> None:
         todo.INBOX.write_text('{"broken"\n', encoding="utf-8")
         notion = NotionStub()
@@ -229,6 +298,13 @@ class TodoDirectIngestTests(unittest.TestCase):
         self.assertEqual(result["reason"], "todo-direct-ingest-missing-item")
         self.assertEqual(self.records(), [])
         self.assertEqual(adapter.messages[0][1], "❓ 請告訴我要記錄的待辦內容。")
+
+    def test_missing_completion_item_gets_one_direct_question(self) -> None:
+        notion = NotionStub()
+        result, adapter = asyncio.run(self.run_hook("完成：", notion, "405"))
+        self.assertEqual(result["reason"], "todo-direct-completion-missing-item")
+        self.assertEqual(notion.updated, 0)
+        self.assertEqual(adapter.messages[0][1], "❓ 請告訴我要完成哪一項待辦。")
 
     def test_unconfigured_chat_fails_closed(self) -> None:
         notion = NotionStub()
