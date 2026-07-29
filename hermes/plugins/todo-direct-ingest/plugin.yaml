@@ -1,5 +1,5 @@
 name: todo-direct-ingest
-version: "1.0.0"
-description: Deterministically records Telegram todo messages before the LLM runs.
+version: "2.0.0"
+description: Lets Hermes interpret Telegram todos, then performs deterministic JSONL and Notion writes.
 requires_env:
   - NOTION_API_KEY

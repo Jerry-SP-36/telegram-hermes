@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
 import os
 import sys
 import tempfile
 import unittest
-from enum import Enum
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -26,20 +24,6 @@ todo = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(todo)
 
 
-class Platform(Enum):
-    TELEGRAM = "telegram"
-
-
-class FakeAdapter:
-    def __init__(self, success: bool = True) -> None:
-        self.messages: list[tuple[str, str]] = []
-        self.success = success
-
-    async def send(self, chat_id: str, text: str) -> SimpleNamespace:
-        self.messages.append((chat_id, text))
-        return SimpleNamespace(success=self.success, error="send failed")
-
-
 class NotionStub:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
@@ -53,6 +37,7 @@ class NotionStub:
         due_date: str | None,
         for_who: str,
         done: bool = False,
+        note: str | None = None,
     ) -> str:
         page_id = f"page-{len(self.pages) + 1}"
         self.pages[page_id] = {
@@ -60,43 +45,58 @@ class NotionStub:
             "due_date": due_date,
             "for_who": for_who,
             "done": done,
+            "note": note,
         }
         return page_id
+
+    @staticmethod
+    def _result(page_id: str, page: dict[str, object]) -> dict[str, object]:
+        return {
+            "id": page_id,
+            "properties": {
+                "Item": {
+                    "title": [
+                        {
+                            "plain_text": page["item"],
+                            "text": {"content": page["item"]},
+                        }
+                    ]
+                },
+                "For Who": {"select": {"name": page["for_who"]}},
+                "Due Date": {
+                    "date": (
+                        None
+                        if page["due_date"] is None
+                        else {"start": page["due_date"]}
+                    )
+                },
+                "Done?": {"checkbox": page["done"]},
+            },
+        }
 
     def __call__(self, method: str, path: str, payload=None):
         if self.fail:
             raise RuntimeError("notion unavailable")
         if path.endswith("/query"):
-            item = payload["filter"]["title"]["equals"]
-            results = []
-            for page_id, page in self.pages.items():
-                stored_item = page["item"]
-                if stored_item != item:
-                    continue
-                results.append(
-                    {
-                        "id": page_id,
-                        "properties": {
-                            "For Who": {"select": {"name": page["for_who"]}},
-                            "Due Date": {
-                                "date": (
-                                    None
-                                    if page["due_date"] is None
-                                    else {"start": page["due_date"]}
-                                )
-                            },
-                            "Done?": {"checkbox": page["done"]},
-                        },
-                    }
-                )
-            return {"results": results}
+            exact_item = None
+            if isinstance(payload, dict) and isinstance(payload.get("filter"), dict):
+                exact_item = payload["filter"]["title"]["equals"]
+            results = [
+                self._result(page_id, page)
+                for page_id, page in self.pages.items()
+                if exact_item is None or page["item"] == exact_item
+            ]
+            return {"results": results, "has_more": False, "next_cursor": None}
         if path == "/v1/pages":
             properties = payload["properties"]
             item = properties["Item"]["title"][0]["text"]["content"]
             due_property = properties.get("Due Date", {}).get("date")
             due_date = due_property.get("start") if due_property else None
             for_who = properties["For Who"]["select"]["name"]
-            self.add_page(item, due_date, for_who)
+            done = properties["Done?"]["checkbox"]
+            note_property = properties.get("備註", {}).get("rich_text")
+            note = note_property[0]["text"]["content"] if note_property else None
+            self.add_page(item, due_date, for_who, done=done, note=note)
             self.created += 1
             return {"url": "https://www.notion.so/test"}
         if method == "PATCH" and path.startswith("/v1/pages/"):
@@ -107,11 +107,25 @@ class NotionStub:
         raise AssertionError(path)
 
 
+class FakePluginContext:
+    def __init__(self) -> None:
+        self.tools: list[dict[str, object]] = []
+        self.hooks: list[tuple[str, object]] = []
+
+    def register_tool(self, **kwargs) -> None:
+        self.tools.append(kwargs)
+
+    def register_hook(self, name, callback) -> None:
+        self.hooks.append((name, callback))
+
+
 class TodoDirectIngestTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_inbox = todo.INBOX
         todo.INBOX = Path(self.temp_dir.name) / "todo-inbox.jsonl"
+        with todo._SESSION_LOCK:
+            todo._TELEGRAM_SESSIONS.clear()
         self.env = patch.dict(
             os.environ,
             {"TODO_TELEGRAM_CHAT_ID": "42", "NOTION_API_KEY": "test-token"},
@@ -122,198 +136,231 @@ class TodoDirectIngestTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.env.stop()
         todo.INBOX = self.original_inbox
+        with todo._SESSION_LOCK:
+            todo._TELEGRAM_SESSIONS.clear()
         self.temp_dir.cleanup()
 
-    @staticmethod
-    def event(text: str, message_id: str = "1", chat_id: str = "42") -> SimpleNamespace:
-        source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id=chat_id, user_id=chat_id)
-        return SimpleNamespace(text=text, message_id=message_id, source=source)
+    def authorize(self, text: str, turn_id: str = "1", session_id: str = "session-1") -> dict:
+        context = todo._remember_telegram_session(
+            platform="telegram",
+            sender_id="42",
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message=text,
+        )
+        self.assertIsNotNone(context)
+        return context
 
-    async def run_hook(self, text: str, notion: NotionStub, message_id: str = "1"):
-        adapter = FakeAdapter()
-        event = self.event(text, message_id)
-        gateway = SimpleNamespace(adapters={event.source.platform: adapter})
+    def execute(self, notion: NotionStub, args: dict, session_id: str = "session-1") -> dict:
         with patch.object(todo, "_notion_request", side_effect=notion):
-            result = todo._intercept_todo(event, gateway)
-            await asyncio.sleep(0)
-        return result, adapter
+            raw = todo._handle_todo_execute(args, session_id=session_id)
+        return json.loads(raw)
 
     def records(self) -> list[dict]:
         if not todo.INBOX.exists():
             return []
         return [json.loads(line) for line in todo.INBOX.read_text(encoding="utf-8").splitlines()]
 
-    def test_clear_todo_prefix_records_without_confirmation(self) -> None:
+    def test_llm_normalized_today_todo_is_written_without_confirmation(self) -> None:
+        original = "今天要詢問歐美亞有關護照申辦的事情"
+        context = self.authorize(original)
+        self.assertIn("歐美亞護照申請", context["context"])
         notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("待辦：拿大頭照", notion))
-        self.assertEqual(result, {"action": "skip", "reason": "todo-direct-ingest"})
-        self.assertEqual([row["item"] for row in self.records()], ["拿大頭照"])
-        self.assertIn("✅ 待辦已記錄並同步到 Notion", adapter.messages[0][1])
-        self.assertNotIn("確認", adapter.messages[0][1])
-
-    def test_remember_prefix_records(self) -> None:
-        notion = NotionStub()
-        asyncio.run(self.run_hook("要記得拿大頭照", notion))
-        self.assertEqual(self.records()[0]["item"], "拿大頭照")
-
-    def test_today_action_keeps_meaningful_text_and_sets_due_date(self) -> None:
-        notion = NotionStub()
-        text = "今天要詢問歐美亞有關護照申辦的事情"
-        _, adapter = asyncio.run(self.run_hook(text, notion))
+        result = self.execute(
+            notion,
+            {
+                "action": "create",
+                "item": "歐美亞護照申請",
+                "due_date": todo.dt.datetime.now(todo.TIMEZONE).date().isoformat(),
+                "for_who": "Myself",
+                "source_text": original,
+            },
+        )
+        self.assertEqual(result["status"], "created")
+        self.assertEqual(result["response"]["action"], "todo_created")
+        self.assertEqual(result["response"]["data"]["item"], "歐美亞護照申請")
+        self.assertEqual(result["response"]["data"]["due_date"], "今天")
+        self.assertNotIn("確認", result["response"]["summary"])
         record = self.records()[0]
-        self.assertEqual(record["item"], text)
-        self.assertEqual(record["due_date"], todo.dt.datetime.now(todo.TIMEZONE).date().isoformat())
-        self.assertIn("期限：今天", adapter.messages[0][1])
+        self.assertEqual(record["item"], "歐美亞護照申請")
+        self.assertEqual(record["note"], original)
+        self.assertEqual(notion.pages["page-1"]["note"], original)
 
-    def test_tomorrow_action_sets_due_date(self) -> None:
+    def test_due_date_falls_back_to_original_text_when_model_omits_it(self) -> None:
+        self.authorize("明天要做 Ansys 簡報")
         notion = NotionStub()
-        asyncio.run(self.run_hook("明天要做 Ansys 簡報", notion))
-        expected = (todo.dt.datetime.now(todo.TIMEZONE).date() + todo.dt.timedelta(days=1)).isoformat()
-        self.assertEqual(self.records()[0]["due_date"], expected)
+        result = self.execute(
+            notion,
+            {
+                "action": "create",
+                "item": "Ansys 演講簡報",
+                "source_text": "明天要做 Ansys 簡報",
+            },
+        )
+        self.assertEqual(result["response"]["data"]["due_date"], "明天")
 
-    def test_todo_query_falls_through(self) -> None:
-        notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("今天要做什麼？", notion))
-        self.assertIsNone(result)
+    def test_pre_llm_hook_does_not_write_or_intercept_queries_chat_or_expense(self) -> None:
+        for turn_id, text in enumerate(("今天要做什麼？", "你好", "午餐 120 元"), 1):
+            context = self.authorize(text, str(turn_id))
+            self.assertIn("不要呼叫此工具", context["context"])
         self.assertEqual(self.records(), [])
-        self.assertEqual(adapter.messages, [])
 
-    def test_slash_command_and_expense_fall_through(self) -> None:
+    def test_same_telegram_turn_and_same_semantic_todo_are_idempotent(self) -> None:
         notion = NotionStub()
-        for index, text in enumerate(("/reset", "午餐 120 元"), 1):
-            result, _ = asyncio.run(self.run_hook(text, notion, str(index)))
-            self.assertIsNone(result)
-        self.assertEqual(self.records(), [])
-
-    def test_explicit_todo_wins_even_when_text_has_amount(self) -> None:
-        notion = NotionStub()
-        result, _ = asyncio.run(self.run_hook("待辦：買文具 120 元", notion))
-        self.assertEqual(result["reason"], "todo-direct-ingest")
-        self.assertEqual(self.records()[0]["item"], "買文具 120 元")
-
-    def test_same_event_is_idempotent_locally_and_in_notion(self) -> None:
-        notion = NotionStub()
-        asyncio.run(self.run_hook("待辦：拿大頭照", notion, "99"))
-        asyncio.run(self.run_hook("待辦：拿大頭照", notion, "99"))
+        args = {"action": "create", "item": "拿大頭照", "source_text": "要記得拿大頭照"}
+        self.authorize("要記得拿大頭照", "99")
+        self.execute(notion, args)
+        self.execute(notion, args)
+        self.authorize("待辦：拿大頭照", "100")
+        self.execute(notion, {**args, "source_text": "待辦：拿大頭照"})
         self.assertEqual(len(self.records()), 1)
-        self.assertEqual(notion.created, 1)
         self.assertEqual(self.records()[0]["source_event_id"], "telegram:42:99")
-
-    def test_same_semantic_todo_with_new_message_id_is_idempotent(self) -> None:
-        notion = NotionStub()
-        asyncio.run(self.run_hook("待辦：拿大頭照", notion, "100"))
-        asyncio.run(self.run_hook("待辦：拿大頭照", notion, "101"))
-        self.assertEqual(len(self.records()), 1)
         self.assertEqual(notion.created, 1)
 
-    def test_same_item_with_different_due_date_is_not_a_duplicate(self) -> None:
+    def test_same_item_with_different_due_date_is_not_duplicate(self) -> None:
         notion = NotionStub()
-        first, first_added = todo._local_record(
-            "確認 Ansys 簡報",
-            "2026-07-30",
-            "Myself",
-            None,
-            "telegram:42:300",
-        )
-        second, second_added = todo._local_record(
-            "確認 Ansys 簡報",
-            "2026-07-31",
-            "Myself",
-            None,
-            "telegram:42:301",
-        )
-        with patch.object(todo, "_notion_request", side_effect=notion):
-            self.assertEqual(todo._sync_to_notion(first), "created")
-            self.assertEqual(todo._sync_to_notion(second), "created")
-        self.assertTrue(first_added)
-        self.assertTrue(second_added)
+        for turn_id, due in (("301", "2026-07-30"), ("302", "2026-07-31")):
+            self.authorize(f"{due} 確認 Ansys 簡報", turn_id)
+            self.execute(
+                notion,
+                {
+                    "action": "create",
+                    "item": "確認 Ansys 簡報",
+                    "due_date": due,
+                    "source_text": f"{due} 確認 Ansys 簡報",
+                },
+            )
         self.assertEqual(len(self.records()), 2)
         self.assertEqual(notion.created, 2)
 
-    def test_clear_completion_updates_one_matching_notion_task(self) -> None:
+    def test_fuzzy_completion_uses_llm_title_and_updates_best_open_notion_page(self) -> None:
         notion = NotionStub()
-        item = "今天要詢問歐美亞有關護照申辦的事情"
         page_id = notion.add_page(
-            item,
+            "今天要詢問歐美亞有關護照申辦的事情",
             todo.dt.datetime.now(todo.TIMEZONE).date().isoformat(),
             "Myself",
         )
-        result, adapter = asyncio.run(self.run_hook(f"完成：{item}", notion, "400"))
-        self.assertEqual(result["reason"], "todo-direct-completion")
+        notion.add_page("整理 Ansys 簡報", None, "Myself")
+        self.authorize("已完成歐美亞護照事情", "400")
+        result = self.execute(
+            notion,
+            {
+                "action": "complete",
+                "item": "歐美亞護照申請",
+                "source_text": "已完成歐美亞護照事情",
+            },
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(notion.pages[page_id]["done"])
+        self.assertFalse(notion.pages["page-2"]["done"])
         self.assertEqual(notion.updated, 1)
+        self.assertEqual(result["response"]["data"]["item"], "歐美亞護照申請")
+        completion = self.records()[0]
+        self.assertEqual(completion["type"], "todo_completion")
+        self.assertEqual(completion["matched_item"], "今天要詢問歐美亞有關護照申辦的事情")
+
+    def test_completion_never_asks_candidates_and_chooses_best_match(self) -> None:
+        notion = NotionStub()
+        first = notion.add_page("拿大頭照", None, "Myself")
+        second = notion.add_page("拿大頭照給公司證件", None, "Myself")
+        self.authorize("完成拿大頭照", "401")
+        result = self.execute(
+            notion,
+            {"action": "complete", "item": "拿大頭照", "source_text": "完成拿大頭照"},
+        )
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(notion.pages[first]["done"])
+        self.assertFalse(notion.pages[second]["done"])
+        self.assertNotIn("候選", result["response"]["summary"])
+        self.assertNotIn("確認", result["response"]["summary"])
+
+    def test_unknown_completion_creates_an_already_completed_record(self) -> None:
+        notion = NotionStub()
+        notion.add_page("完全不相關的工作", None, "Myself")
+        self.authorize("已完成買郵票", "402")
+        result = self.execute(
+            notion,
+            {"action": "complete", "item": "買郵票", "source_text": "已完成買郵票"},
+        )
+        self.assertEqual(result["status"], "completed_created")
+        self.assertEqual(notion.created, 1)
+        created = notion.pages["page-2"]
+        self.assertEqual(created["item"], "買郵票")
+        self.assertTrue(created["done"])
+        self.assertTrue(self.records()[0]["done"])
+
+    def test_already_completed_is_idempotent(self) -> None:
+        notion = NotionStub()
+        page_id = notion.add_page("拿大頭照", None, "Myself", done=True)
+        self.authorize("已完成拿大頭照", "403")
+        result = self.execute(
+            notion,
+            {"action": "complete", "item": "拿大頭照", "source_text": "已完成拿大頭照"},
+        )
+        self.assertEqual(result["status"], "already_completed")
         self.assertTrue(notion.pages[page_id]["done"])
-        self.assertEqual(self.records(), [])
-        self.assertIn("待辦已完成並更新到 Notion", adapter.messages[0][1])
-
-    def test_completion_is_idempotent_when_notion_is_already_done(self) -> None:
-        notion = NotionStub()
-        item = "拿大頭照"
-        page_id = notion.add_page(item, None, "Myself", done=True)
-        _, adapter = asyncio.run(self.run_hook(f"已完成 {item}", notion, "401"))
         self.assertEqual(notion.updated, 0)
-        self.assertTrue(notion.pages[page_id]["done"])
-        self.assertIn("已是完成狀態", adapter.messages[0][1])
-
-    def test_completion_never_updates_ambiguous_or_missing_tasks(self) -> None:
-        notion = NotionStub()
-        notion.add_page("確認簡報", "2026-07-30", "Myself")
-        notion.add_page("確認簡報", "2026-07-31", "Myself")
-        _, ambiguous = asyncio.run(self.run_hook("完成：確認簡報", notion, "402"))
-        _, missing = asyncio.run(self.run_hook("完成：不存在的待辦", notion, "403"))
-        self.assertEqual(notion.updated, 0)
-        self.assertIn("多個同名", ambiguous.messages[0][1])
-        self.assertIn("找不到", missing.messages[0][1])
-
-    def test_completion_query_falls_through_without_updating_notion(self) -> None:
-        notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("完成了什麼？", notion, "404"))
-        self.assertIsNone(result)
-        self.assertEqual(notion.updated, 0)
-        self.assertEqual(adapter.messages, [])
-
-    def test_invalid_jsonl_fails_closed(self) -> None:
-        todo.INBOX.write_text('{"broken"\n', encoding="utf-8")
-        notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("待辦：拿大頭照", notion))
-        self.assertEqual(result["reason"], "todo-direct-ingest-local-failed")
-        self.assertIn("已停止寫入", adapter.messages[0][1])
-        self.assertEqual(todo.INBOX.read_text(encoding="utf-8"), '{"broken"\n')
 
     def test_notion_failure_keeps_local_then_retry_syncs_without_duplicate(self) -> None:
-        failing = NotionStub(fail=True)
-        result, adapter = asyncio.run(self.run_hook("待辦：拿大頭照", failing, "200"))
-        self.assertEqual(result["reason"], "todo-direct-ingest")
-        self.assertIn("尚未同步到 Notion", adapter.messages[0][1])
+        args = {"action": "create", "item": "拿大頭照", "source_text": "待辦：拿大頭照"}
+        self.authorize("待辦：拿大頭照", "500")
+        failing_result = self.execute(NotionStub(fail=True), args)
+        self.assertEqual(failing_result["status"], "local_only")
         self.assertEqual(len(self.records()), 1)
 
         recovered = NotionStub()
-        _, retry_adapter = asyncio.run(self.run_hook("待辦：拿大頭照", recovered, "201"))
+        self.authorize("待辦：拿大頭照", "501")
+        retry_result = self.execute(recovered, args)
+        self.assertEqual(retry_result["status"], "created")
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(recovered.created, 1)
-        self.assertIn("✅", retry_adapter.messages[0][1])
 
-    def test_missing_item_gets_one_direct_question_without_write(self) -> None:
+    def test_completion_notion_failure_retains_one_event_for_retry(self) -> None:
+        failing = NotionStub(fail=True)
+        self.authorize("完成拿大頭照", "510")
+        args = {"action": "complete", "item": "拿大頭照", "source_text": "完成拿大頭照"}
+        first = self.execute(failing, args)
+        self.assertEqual(first["status"], "local_only")
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["type"], "todo_completion")
+
+        recovered = NotionStub()
+        recovered.add_page("拿大頭照", None, "Myself")
+        self.authorize("完成拿大頭照", "511")
+        second = self.execute(recovered, args)
+        self.assertEqual(second["status"], "completed")
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(recovered.updated, 1)
+
+    def test_invalid_jsonl_fails_closed_before_notion_write(self) -> None:
+        todo.INBOX.write_text('{"broken"\n', encoding="utf-8")
         notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("待辦：", notion))
-        self.assertEqual(result["reason"], "todo-direct-ingest-missing-item")
+        self.authorize("待辦：拿大頭照", "600")
+        result = self.execute(
+            notion,
+            {"action": "create", "item": "拿大頭照", "source_text": "待辦：拿大頭照"},
+        )
+        self.assertEqual(result["status"], "local_invalid")
+        self.assertEqual(notion.created, 0)
+        self.assertEqual(todo.INBOX.read_text(encoding="utf-8"), '{"broken"\n')
+
+    def test_tool_rejects_unapproved_or_non_telegram_sessions(self) -> None:
+        notion = NotionStub()
+        result = self.execute(
+            notion,
+            {"action": "create", "item": "拿大頭照", "source_text": "待辦：拿大頭照"},
+            session_id="missing",
+        )
+        self.assertEqual(result["status"], "unauthorized")
         self.assertEqual(self.records(), [])
-        self.assertEqual(adapter.messages[0][1], "❓ 請告訴我要記錄的待辦內容。")
-
-    def test_missing_completion_item_gets_one_direct_question(self) -> None:
-        notion = NotionStub()
-        result, adapter = asyncio.run(self.run_hook("完成：", notion, "405"))
-        self.assertEqual(result["reason"], "todo-direct-completion-missing-item")
-        self.assertEqual(notion.updated, 0)
-        self.assertEqual(adapter.messages[0][1], "❓ 請告訴我要完成哪一項待辦。")
-
-    def test_unconfigured_chat_fails_closed(self) -> None:
-        notion = NotionStub()
-        with patch.object(todo, "_allowed_chat_ids", return_value=set()):
-            result, adapter = asyncio.run(
-                self.run_hook("待辦：拿大頭照", notion, message_id="1")
+        self.assertIsNone(
+            todo._remember_telegram_session(
+                platform="discord",
+                sender_id="42",
+                session_id="discord-session",
+                user_message="待辦：拿大頭照",
             )
-        self.assertIsNone(result)
-        self.assertEqual(adapter.messages, [])
+        )
 
     def test_allowed_chat_ids_uses_active_hermes_home(self) -> None:
         config_path = Path(self.temp_dir.name) / "config.yaml"
@@ -331,10 +378,14 @@ class TodoDirectIngestTests(unittest.TestCase):
             with patch.dict(sys.modules, {"hermes_constants": constants}):
                 self.assertEqual(todo._allowed_chat_ids(), {"42"})
 
-    def test_registers_only_the_pre_dispatch_hook(self) -> None:
-        calls = []
-        todo.register(SimpleNamespace(register_hook=lambda name, callback: calls.append((name, callback))))
-        self.assertEqual(calls, [("pre_gateway_dispatch", todo._intercept_todo)])
+    def test_registers_one_native_tool_and_one_pre_llm_hook(self) -> None:
+        context = FakePluginContext()
+        todo.register(context)
+        self.assertEqual(len(context.tools), 1)
+        self.assertEqual(context.tools[0]["name"], "todo_execute")
+        self.assertEqual(context.tools[0]["toolset"], "todo_capture")
+        self.assertIs(context.tools[0]["handler"], todo._handle_todo_execute)
+        self.assertEqual(context.hooks, [("pre_llm_call", todo._remember_telegram_session)])
 
 
 if __name__ == "__main__":

@@ -25,29 +25,35 @@ last Telegram-sender step.
 The bridge has no database, queue, state machine, callback routing, or
 confidence-based routing.
 
-## Deterministic Hermes write plugins
+## Hermes write plugins
 
-Business writes that must succeed independently of the LLM belong in native
-Hermes `pre_gateway_dispatch` plugins. The canonical todo plugin is stored at
-[`hermes/plugins/todo-direct-ingest`](hermes/plugins/todo-direct-ingest): it
-validates and appends the Hermes todo JSONL, synchronizes Notion, sends a
-human-readable acknowledgement, and returns `skip` before the LLM runs. It is
-deployed to the Hermes service's persistent `/opt/data/plugins` directory.
-At startup, Zeabur copies only the Todo and Expense plugin files into Hermes's
-active `/opt/data/runtime/plugins` home. The Todo runtime directory is named
-`00-todo-direct-ingest` so Hermes registers its `pre_gateway_dispatch` hook
-before Expense without changing either plugin's manifest or business logic.
+Business writes use small native Hermes plugins. The canonical Todo plugin is
+stored at [`hermes/plugins/todo-direct-ingest`](hermes/plugins/todo-direct-ingest).
+It adds a native `todo_execute` tool and a Telegram-private-chat
+`pre_llm_call` instruction. Hermes interprets natural language into a concise
+item, due date, person, and create/complete action; the tool is the only Todo
+component allowed to validate and append the Hermes JSONL or update Notion.
+
+This keeps one Telegram entry point and one LLM conversation. The plugin does
+not poll Telegram, send its own acknowledgement, invoke a terminal, or ask the
+model to write files. It is deployed to the Hermes service's persistent
+`/opt/data/plugins` directory. At startup, Zeabur copies only the Todo and
+Expense plugin files into Hermes's active `/opt/data/runtime/plugins` home.
+The Todo runtime directory remains `00-todo-direct-ingest`; the existing
+Expense pre-dispatch route is unchanged and still handles explicit expenses
+before the LLM.
 
 This is deliberately separate from the response bridge. The bridge still owns
 only final-response rendering, while the existing `expense-direct-ingest`
 plugin and the single built-in Telegram poller remain unchanged.
 
-### Telegram 待辦指令
+### Telegram 待辦語意
 
-- 建立待辦：`待辦：<內容>`、`要記得<內容>`、`今天要…`。
-- 完成待辦：`完成：<完整原待辦名稱>` 或 `已完成 <完整原待辦名稱>`。
-
-完成指令只會把唯一匹配的 Notion `Done?` 設為完成；同名未完成待辦超過一筆時不會猜測或更新。原始 `todo-inbox.jsonl` 保持 append-only，Notion 是待辦完成狀態的真相。
+- 自然語句可直接新增，例如 `今天要詢問歐美亞有關護照申辦的事情`；Hermes 會整理成短項目與期限，不需要再輸入固定前綴。
+- 自然語句可直接完成，例如 `已完成歐美亞護照事情`；Hermes 先整理核心項目，executor 再選擇最相近的未完成 Notion 待辦。
+- 不詢問候選或二次確認。沒有可信匹配時，建立一筆已完成紀錄，留待每日復盤。
+- Telegram 原文保留在 JSONL 與 Notion `備註`；`todo-inbox.jsonl` 維持 append-only。
+- 一般聊天、待辦查詢、`/指令` 與支出訊息不使用 Todo 工具。
 
 ## Local verification
 

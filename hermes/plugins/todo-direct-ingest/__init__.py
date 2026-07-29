@@ -1,14 +1,16 @@
-"""Deterministic Telegram-to-todo bridge for Hermes Gateway."""
+"""Hermes-interpreted Telegram todo capture with deterministic side effects."""
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
+import difflib
 import json
 import logging
 import os
 import re
 import secrets
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -25,30 +27,69 @@ DATA_SOURCE_ID = os.getenv(
 ).strip()
 NOTION_VERSION = "2026-03-11"
 DEFAULT_FOR_WHO = "Myself"
+TOOL_NAME = "todo_execute"
+TOOLSET_NAME = "todo_capture"
+SESSION_TTL_SECONDS = 10 * 60
+MATCH_THRESHOLD = 0.42
 
-_PREFIX_PATTERN = re.compile(
-    r"^(?:待辦\s*[:：]|提醒我(?:要|去|一下)?|記住(?:要|去)?|要記得|加入任務\s*[:：]?)\s*(?P<item>.*)$"
-)
-_COMPLETION_PATTERN = re.compile(
-    r"^(?:(?:待辦|任務)\s*)?(?:我\s*)?(?:已)?完成(?:了)?(?:待辦|任務)?\s*[:：]?\s*(?P<item>.*)$"
-)
-_DATED_ACTION_PATTERN = re.compile(r"^(?:今天|明天)要\S.*$")
-_QUERY_PATTERN = re.compile(
-    r"(?:今天|明天)?要做什麼|(?:有|有哪些|查看|查詢|列出|顯示).{0,8}待辦|待辦.{0,8}(?:有什麼|有哪些|清單|列表|進度|狀態)"
-)
 _ISO_DATE_PATTERN = re.compile(r"(?<!\d)(?P<date>20\d{2}-\d{1,2}-\d{1,2})(?!\d)")
 _LOCAL_DATE_PATTERN = re.compile(
     r"(?<!\d)(?P<month>1[0-2]|0?[1-9])(?:/|月)(?P<day>3[01]|[12]\d|0?[1-9])(?:日)?(?!\d)"
 )
+_MATCH_NOISE_PATTERN = re.compile(
+    r"今天|明天|後天|待辦|任務|提醒我|記得|要記得|已經|已完成|完成了?|"
+    r"我要|要做|去做|處理|詢問|有關|相關|申辦|申請的事情|的事情|事情|一下"
+)
+_PUNCTUATION_PATTERN = re.compile(r"[\s\-—_，。！？、：:；;,.!?「」『』（）()\[\]{}]+")
+
+_SESSION_LOCK = threading.Lock()
+_TELEGRAM_SESSIONS: dict[str, dict[str, str | float | None]] = {}
+
+
+TODO_EXECUTE_SCHEMA = {
+    "name": TOOL_NAME,
+    "description": (
+        "Create or complete a personal todo after interpreting the user's natural "
+        "Traditional-Chinese request. Use only for an explicit todo action, never for "
+        "todo queries, general chat, slash commands, or expense capture."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "complete"],
+                "description": "Whether to create a todo or mark one completed.",
+            },
+            "item": {
+                "type": "string",
+                "description": (
+                    "A short normalized task title. Remove conversational filler, "
+                    "relative-date words, and phrases such as 有關/的事情 while preserving meaning."
+                ),
+            },
+            "due_date": {
+                "type": "string",
+                "description": (
+                    "Due date as YYYY-MM-DD in Asia/Taipei. Omit when no due date was stated."
+                ),
+            },
+            "for_who": {
+                "type": "string",
+                "description": "Responsible person; use Myself when the user did not specify one.",
+            },
+            "source_text": {
+                "type": "string",
+                "description": "The user's original Telegram text, retained for review.",
+            },
+        },
+        "required": ["action", "item", "source_text"],
+    },
+}
 
 
 class TodoDataError(RuntimeError):
     """Raised when the append-only todo inbox cannot be trusted."""
-
-
-def _platform_name(source: Any) -> str:
-    platform = getattr(source, "platform", "")
-    return str(getattr(platform, "value", platform)).lower()
 
 
 def _allowed_chat_ids() -> set[str]:
@@ -99,7 +140,7 @@ def _allowed_chat_ids() -> set[str]:
                     indent = len(candidate) - len(candidate.lstrip())
                     if indent <= base_indent:
                         break
-                    key = candidate.strip().split(":", 1)[0].strip().strip("\"")
+                    key = candidate.strip().split(":", 1)[0].strip().strip("\"'")
                     if key:
                         keys.add(key)
                 return keys
@@ -108,48 +149,71 @@ def _allowed_chat_ids() -> set[str]:
     return set()
 
 
-def _is_query(text: str) -> bool:
-    return bool(_QUERY_PATTERN.search(text))
+def _remember_telegram_session(**kwargs: Any) -> dict[str, str] | None:
+    """Give Hermes Todo guidance only inside the configured private Telegram chat."""
 
-
-def _parse_todo_text(text: str) -> tuple[str, str | None] | None:
-    normalized = (text or "").strip()
-    if not normalized or normalized.startswith("/"):
+    platform = str(kwargs.get("platform") or "").strip().lower()
+    sender_id = str(kwargs.get("sender_id") or "").strip()
+    session_id = str(kwargs.get("session_id") or "").strip()
+    if platform != "telegram" or not sender_id or sender_id not in _allowed_chat_ids():
         return None
 
-    prefix_match = _PREFIX_PATTERN.fullmatch(normalized)
-    if prefix_match is not None:
-        item = prefix_match.group("item").strip()
-        if item and not _is_query(item):
-            return item, _derive_due_date(item)
-        if not item:
-            return "", None
-        return None
+    now = time.monotonic()
+    with _SESSION_LOCK:
+        expired = [
+            key
+            for key, value in _TELEGRAM_SESSIONS.items()
+            if now - float(value.get("seen_at") or 0) > SESSION_TTL_SECONDS
+        ]
+        for key in expired:
+            _TELEGRAM_SESSIONS.pop(key, None)
+        if session_id:
+            turn_id = str(kwargs.get("turn_id") or "").strip()
+            _TELEGRAM_SESSIONS[session_id] = {
+                "sender_id": sender_id,
+                "source_text": str(kwargs.get("user_message") or "").strip(),
+                "source_event_id": (
+                    f"telegram:{sender_id}:{turn_id}" if turn_id else None
+                ),
+                "seen_at": now,
+            }
 
-    if _is_query(normalized) or "?" in normalized or "？" in normalized:
-        return None
-    if _DATED_ACTION_PATTERN.fullmatch(normalized):
-        return normalized, _derive_due_date(normalized)
-    return None
+    today = dt.datetime.now(TIMEZONE).date()
+    tomorrow = today + dt.timedelta(days=1)
+    return {
+        "context": (
+            "Telegram 私人待辦規則（本回合可用 todo_execute）：\n"
+            "- 由你理解自然語言，不要把整句原文直接當成 item。item 要短、清楚並保留核心意思；"
+            "例如「今天要詢問歐美亞有關護照申辦的事情」應整理成「歐美亞護照申請」。\n"
+            f"- Asia/Taipei 今天是 {today.isoformat()}，明天是 {tomorrow.isoformat()}。"
+            "期限轉成 YYYY-MM-DD；未提期限就省略 due_date。未提對象時 for_who=Myself。\n"
+            "- 明確要新增、提醒、記住或完成待辦時，直接呼叫 todo_execute，一律不詢問確認。"
+            "完成語句也要整理成核心項目，工具會自動找最合適的未完成項目。\n"
+            "- 查詢型句子（例如今天要做什麼）、一般聊天、/指令或支出訊息不要呼叫此工具。\n"
+            "- 禁止用 terminal、file、Notion 或其他工具自行寫待辦；Todo 只能由 todo_execute 寫入。\n"
+            "- 工具回傳 response 後，最終只輸出 Telegram JSON contract，逐字採用 response 的 "
+            "type/action/title/summary/data；confidence=1.0、actions=[]，不要補問或顯示內部欄位。"
+        )
+    }
 
 
-def _parse_completion_text(text: str) -> str | None:
-    normalized = (text or "").strip()
-    if not normalized or normalized.startswith("/"):
+def _authorized_context(session_id: str) -> dict[str, str | float | None] | None:
+    if not session_id:
         return None
-    match = _COMPLETION_PATTERN.fullmatch(normalized)
-    if match is None:
-        return None
-    item = match.group("item").strip().strip("「」『』\"'")
-    if not item:
-        return ""
-    if "?" in item or "？" in item or _is_query(item):
-        return None
-    return item
+    with _SESSION_LOCK:
+        context = _TELEGRAM_SESSIONS.get(session_id)
+        if context is None:
+            return None
+        if time.monotonic() - float(context.get("seen_at") or 0) > SESSION_TTL_SECONDS:
+            _TELEGRAM_SESSIONS.pop(session_id, None)
+            return None
+        return dict(context)
 
 
 def _derive_due_date(text: str, today: dt.date | None = None) -> str | None:
     today = today or dt.datetime.now(TIMEZONE).date()
+    if "後天" in text:
+        return (today + dt.timedelta(days=2)).isoformat()
     if "明天" in text:
         return (today + dt.timedelta(days=1)).isoformat()
     if "今天" in text:
@@ -176,13 +240,14 @@ def _derive_due_date(text: str, today: dt.date | None = None) -> str | None:
         return None
 
 
-def _source_event_id(event: Any) -> str | None:
-    source = getattr(event, "source", None)
-    chat_id = str(getattr(source, "chat_id", "") or "").strip()
-    message_id = str(getattr(event, "message_id", "") or "").strip()
-    if not chat_id or not message_id:
-        return None
-    return f"telegram:{chat_id}:{message_id}"
+def _validated_due_date(value: Any, source_text: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return _derive_due_date(source_text)
+    try:
+        return dt.date.fromisoformat(text).isoformat()
+    except ValueError as error:
+        raise ValueError("期限格式無法辨識") from error
 
 
 def _read_inbox() -> list[dict[str, Any]]:
@@ -202,12 +267,31 @@ def _read_inbox() -> list[dict[str, Any]]:
     return records
 
 
+def _append_verified(record: dict[str, Any]) -> None:
+    INBOX.parent.mkdir(parents=True, exist_ok=True)
+    with INBOX.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    verified = next((row for row in _read_inbox() if row.get("id") == record["id"]), None)
+    if verified != record:
+        raise TodoDataError("todo append verification failed")
+
+
+def _new_record_id(prefix: str) -> tuple[str, str]:
+    now = dt.datetime.now(TIMEZONE)
+    record_id = prefix + now.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2)
+    return record_id, now.isoformat(timespec="seconds")
+
+
 def _local_record(
     item: str,
     due_date: str | None,
     for_who: str,
     note: str | None,
     source_event_id: str | None,
+    *,
+    done: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     records = _read_inbox()
     if source_event_id:
@@ -220,30 +304,71 @@ def _local_record(
             and record.get("item") == item
             and record.get("due_date") == due_date
             and record.get("for_who") == for_who
+            and bool(record.get("done")) is done
         ):
             return record, False
 
-    now = dt.datetime.now(TIMEZONE)
+    record_id, created_at = _new_record_id("HERMES-TELEGRAM-")
     record = {
         "type": "todo",
-        "id": "HERMES-TELEGRAM-" + now.strftime("%Y%m%d-%H%M%S-") + secrets.token_hex(2),
-        "created_at": now.isoformat(timespec="seconds"),
+        "id": record_id,
+        "created_at": created_at,
         "item": item,
         "due_date": due_date,
         "for_who": for_who,
+        "done": done,
         "note": note,
         "source": "telegram",
         "source_event_id": source_event_id,
     }
-    INBOX.parent.mkdir(parents=True, exist_ok=True)
-    with INBOX.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    _append_verified(record)
+    return record, True
 
-    verified = next((row for row in _read_inbox() if row.get("id") == record["id"]), None)
-    if verified != record:
-        raise TodoDataError("todo append verification failed")
+
+def _local_completion_record(
+    requested_item: str,
+    matched: dict[str, Any] | None,
+    note: str,
+    source_event_id: str | None,
+) -> tuple[dict[str, Any], bool]:
+    records = _read_inbox()
+    page_id = str((matched or {}).get("page_id") or "") or None
+    if source_event_id:
+        for record in reversed(records):
+            if record.get("source_event_id") == source_event_id:
+                return record, False
+    for record in reversed(records):
+        if (
+            record.get("type") == "todo_completion"
+            and record.get("requested_item") == requested_item
+            and (
+                not page_id
+                or record.get("notion_page_id") in (None, page_id)
+            )
+        ):
+            return record, False
+    if page_id:
+        for record in reversed(records):
+            if record.get("type") == "todo_completion" and record.get("notion_page_id") == page_id:
+                return record, False
+
+    record_id, created_at = _new_record_id("HERMES-TODO-DONE-")
+    record = {
+        "type": "todo_completion",
+        "id": record_id,
+        "created_at": created_at,
+        "item": requested_item,
+        "matched_item": (matched or {}).get("item"),
+        "requested_item": requested_item,
+        "due_date": (matched or {}).get("due_date"),
+        "for_who": (matched or {}).get("for_who") or DEFAULT_FOR_WHO,
+        "done": True,
+        "note": note,
+        "source": "telegram",
+        "source_event_id": source_event_id,
+        "notion_page_id": page_id,
+    }
+    _append_verified(record)
     return record, True
 
 
@@ -275,66 +400,84 @@ def _notion_request(method: str, path: str, payload: dict[str, Any] | None = Non
 
 
 def _notion_select_name(page: dict[str, Any], property_name: str) -> str | None:
-    properties = page.get("properties")
-    if not isinstance(properties, dict):
-        return None
-    value = properties.get(property_name)
-    if not isinstance(value, dict):
-        return None
-    selected = value.get("select")
-    if not isinstance(selected, dict):
-        return None
-    name = selected.get("name")
+    value = (page.get("properties") or {}).get(property_name)
+    selected = value.get("select") if isinstance(value, dict) else None
+    name = selected.get("name") if isinstance(selected, dict) else None
     return name if isinstance(name, str) else None
 
 
 def _notion_date_start(page: dict[str, Any], property_name: str) -> str | None:
-    properties = page.get("properties")
-    if not isinstance(properties, dict):
-        return None
-    value = properties.get(property_name)
-    if not isinstance(value, dict):
-        return None
-    date_value = value.get("date")
-    if not isinstance(date_value, dict):
-        return None
-    start = date_value.get("start")
+    value = (page.get("properties") or {}).get(property_name)
+    date_value = value.get("date") if isinstance(value, dict) else None
+    start = date_value.get("start") if isinstance(date_value, dict) else None
     return start[:10] if isinstance(start, str) else None
 
 
 def _notion_checkbox(page: dict[str, Any], property_name: str) -> bool | None:
-    properties = page.get("properties")
-    if not isinstance(properties, dict):
-        return None
-    value = properties.get(property_name)
-    if not isinstance(value, dict):
-        return None
-    checked = value.get("checkbox")
+    value = (page.get("properties") or {}).get(property_name)
+    checked = value.get("checkbox") if isinstance(value, dict) else None
     return checked if isinstance(checked, bool) else None
+
+
+def _notion_title(page: dict[str, Any], property_name: str = "Item") -> str | None:
+    value = (page.get("properties") or {}).get(property_name)
+    title = value.get("title") if isinstance(value, dict) else None
+    if not isinstance(title, list):
+        return None
+    parts: list[str] = []
+    for fragment in title:
+        if not isinstance(fragment, dict):
+            continue
+        plain = fragment.get("plain_text")
+        if isinstance(plain, str):
+            parts.append(plain)
+            continue
+        content = (fragment.get("text") or {}).get("content")
+        if isinstance(content, str):
+            parts.append(content)
+    result = "".join(parts).strip()
+    return result or None
 
 
 def _query_todos_by_item(item: str) -> list[dict[str, Any]]:
     response = _notion_request(
         "POST",
         f"/v1/data_sources/{DATA_SOURCE_ID}/query",
-        {
-            "filter": {
-                "property": "Item",
-                "title": {"equals": item},
-            },
-            "page_size": 100,
-        },
+        {"filter": {"property": "Item", "title": {"equals": item}}, "page_size": 100},
     )
     results = response.get("results", []) if isinstance(response, dict) else []
     return [page for page in results if isinstance(page, dict)]
 
 
+def _query_all_todos() -> list[dict[str, Any]]:
+    pages: list[dict[str, Any]] = []
+    cursor: str | None = None
+    for _ in range(10):
+        payload: dict[str, Any] = {"page_size": 100}
+        if cursor:
+            payload["start_cursor"] = cursor
+        response = _notion_request(
+            "POST", f"/v1/data_sources/{DATA_SOURCE_ID}/query", payload
+        )
+        if not isinstance(response, dict):
+            break
+        pages.extend(page for page in response.get("results", []) if isinstance(page, dict))
+        if not response.get("has_more"):
+            break
+        next_cursor = response.get("next_cursor")
+        cursor = next_cursor if isinstance(next_cursor, str) and next_cursor else None
+        if cursor is None:
+            break
+    return pages
+
+
 def _query_matching_todo(record: dict[str, Any]) -> bool:
-    results = _query_todos_by_item(record["item"])
+    expected_done = bool(record.get("done"))
     return any(
         _notion_select_name(page, "For Who") == record["for_who"]
         and _notion_date_start(page, "Due Date") == record.get("due_date")
-        for page in results
+        and bool(_notion_checkbox(page, "Done?")) is expected_done
+        for page in _query_todos_by_item(record["item"])
     )
 
 
@@ -344,7 +487,7 @@ def _sync_to_notion(record: dict[str, Any]) -> str:
     properties: dict[str, Any] = {
         "Item": {"title": [{"text": {"content": record["item"]}}]},
         "For Who": {"select": {"name": record["for_who"]}},
-        "Done?": {"checkbox": False},
+        "Done?": {"checkbox": bool(record.get("done"))},
         "Date": {"date": {"start": record["created_at"][:10]}},
     }
     if record.get("due_date"):
@@ -364,33 +507,64 @@ def _sync_to_notion(record: dict[str, Any]) -> str:
     return "created"
 
 
-def _todo_from_notion_page(item: str, page: dict[str, Any]) -> dict[str, Any]:
+def _todo_from_notion_page(page: dict[str, Any]) -> dict[str, Any] | None:
+    item = _notion_title(page)
+    page_id = page.get("id")
+    if not item or not isinstance(page_id, str) or not page_id:
+        return None
     return {
+        "page_id": page_id,
         "item": item,
         "due_date": _notion_date_start(page, "Due Date"),
         "for_who": _notion_select_name(page, "For Who") or DEFAULT_FOR_WHO,
+        "done": _notion_checkbox(page, "Done?") is True,
     }
 
 
-def _complete_notion_todo(item: str) -> tuple[str, dict[str, Any] | None]:
-    pages = _query_todos_by_item(item)
-    incomplete = [page for page in pages if _notion_checkbox(page, "Done?") is not True]
-    if len(incomplete) > 1:
-        return "ambiguous", None
-    if len(incomplete) == 1:
-        page = incomplete[0]
-        page_id = page.get("id")
-        if not isinstance(page_id, str) or not page_id:
-            raise RuntimeError("Notion task page id is missing")
-        _notion_request(
-            "PATCH",
-            f"/v1/pages/{page_id}",
-            {"properties": {"Done?": {"checkbox": True}}},
-        )
-        return "completed", _todo_from_notion_page(item, page)
-    if pages:
-        return "already_completed", _todo_from_notion_page(item, pages[0])
-    return "not_found", None
+def _matching_text(value: str) -> str:
+    text = _PUNCTUATION_PATTERN.sub("", value.lower())
+    return _MATCH_NOISE_PATTERN.sub("", text)
+
+
+def _match_score(requested: str, candidate: str) -> float:
+    raw_requested = _PUNCTUATION_PATTERN.sub("", requested.lower())
+    raw_candidate = _PUNCTUATION_PATTERN.sub("", candidate.lower())
+    semantic_requested = _matching_text(requested) or raw_requested
+    semantic_candidate = _matching_text(candidate) or raw_candidate
+    if semantic_requested == semantic_candidate:
+        return 1.0
+    sequence = difflib.SequenceMatcher(None, semantic_requested, semantic_candidate).ratio()
+    requested_chars = set(semantic_requested)
+    candidate_chars = set(semantic_candidate)
+    union = requested_chars | candidate_chars
+    overlap = len(requested_chars & candidate_chars) / len(union) if union else 0.0
+    containment = (
+        min(len(semantic_requested), len(semantic_candidate))
+        / max(len(semantic_requested), len(semantic_candidate))
+        if semantic_requested in semantic_candidate or semantic_candidate in semantic_requested
+        else 0.0
+    )
+    return max(sequence, overlap, containment)
+
+
+def _best_todo_match(
+    requested_item: str, pages: list[dict[str, Any]], *, done: bool
+) -> tuple[dict[str, Any] | None, float]:
+    candidates = [candidate for page in pages if (candidate := _todo_from_notion_page(page))]
+    candidates = [candidate for candidate in candidates if bool(candidate["done"]) is done]
+    if not candidates:
+        return None, 0.0
+    scored = [(_match_score(requested_item, str(candidate["item"])), candidate) for candidate in candidates]
+    score, best = max(scored, key=lambda pair: pair[0])
+    return best, score
+
+
+def _complete_notion_page(candidate: dict[str, Any]) -> None:
+    _notion_request(
+        "PATCH",
+        f"/v1/pages/{candidate['page_id']}",
+        {"properties": {"Done?": {"checkbox": True}}},
+    )
 
 
 def _due_label(due_date: str | None, today: dt.date | None = None) -> str:
@@ -404,161 +578,253 @@ def _due_label(due_date: str | None, today: dt.date | None = None) -> str:
     return due_date
 
 
-def _success_reply(record: dict[str, Any]) -> str:
-    return (
-        "✅ 待辦已記錄並同步到 Notion\n\n"
-        f"項目：{record['item']}\n"
-        f"期限：{_due_label(record.get('due_date'))}\n"
-        f"對象：{record['for_who']}"
+def _response(
+    response_type: str,
+    action: str,
+    summary: str,
+    data: dict[str, Any],
+    *,
+    title: str = "",
+    status: str,
+) -> str:
+    return json.dumps(
+        {
+            "success": response_type != "error",
+            "status": status,
+            "response": {
+                "type": response_type,
+                "action": action,
+                "title": title,
+                "summary": summary,
+                "data": data,
+            },
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
 
 
-def _notion_warning_reply(record: dict[str, Any]) -> str:
-    return (
-        "⚠️ 待辦已保留在 Hermes，但尚未同步到 Notion\n\n"
-        f"項目：{record['item']}\n"
-        "稍後重試不會重複建立待辦。"
+def _success_data(record: dict[str, Any]) -> dict[str, str]:
+    return {
+        "item": str(record["item"]),
+        "due_date": _due_label(record.get("due_date")),
+        "for_who": str(record.get("for_who") or DEFAULT_FOR_WHO),
+    }
+
+
+def _local_failure(item: str, reason: str, status: str) -> str:
+    return _response(
+        "error",
+        "todo_failed",
+        f"待辦未記錄：{reason}",
+        {"item": item},
+        status=status,
     )
 
 
-def _completion_success_reply(record: dict[str, Any]) -> str:
-    return (
-        "✅ 待辦已完成並更新到 Notion\n\n"
-        f"項目：{record['item']}\n"
-        f"期限：{_due_label(record.get('due_date'))}\n"
-        f"對象：{record['for_who']}"
+def _notion_warning(record: dict[str, Any], action: str, summary: str) -> str:
+    return _response(
+        "confirm",
+        action,
+        summary,
+        _success_data(record),
+        title="Notion 尚未同步",
+        status="local_only",
     )
 
 
-def _completion_already_done_reply(record: dict[str, Any]) -> str:
-    return (
-        "✅ 待辦已是完成狀態\n\n"
-        f"項目：{record['item']}\n"
-        f"期限：{_due_label(record.get('due_date'))}\n"
-        f"對象：{record['for_who']}"
-    )
-
-
-def _completion_not_found_reply(item: str) -> str:
-    return (
-        "❓ 找不到尚未完成的待辦\n\n"
-        f"項目：{item}\n"
-        "請確認名稱是否和原待辦一致。"
-    )
-
-
-def _completion_ambiguous_reply(item: str) -> str:
-    return (
-        "❓ 找到多個同名的未完成待辦\n\n"
-        f"項目：{item}\n"
-        "請輸入完整的原待辦名稱後再完成。"
-    )
-
-
-async def _send_reply(gateway: Any, event: Any, text: str) -> None:
-    source = event.source
-    adapter = gateway.adapters.get(source.platform)
-    if adapter is None:
-        logger.error("Telegram adapter unavailable after todo ingest")
-        return
-    result = await adapter.send(str(source.chat_id), text)
-    if result is not None and getattr(result, "success", True) is False:
-        logger.error(
-            "Telegram todo acknowledgement failed: %s",
-            getattr(result, "error", "unknown"),
-        )
-
-
-def _schedule_reply(gateway: Any, event: Any, reply: str) -> None:
-    try:
-        asyncio.get_running_loop().create_task(_send_reply(gateway, event, reply))
-    except RuntimeError:
-        logger.error("No running event loop available for Telegram todo acknowledgement")
-
-
-def _intercept_todo(event: Any, gateway: Any, **kwargs: Any) -> dict[str, str] | None:
-    del kwargs
-    source = getattr(event, "source", None)
-    if source is None or _platform_name(source) != "telegram":
-        return None
-
-    allowed_chats = _allowed_chat_ids()
-    chat_id = str(getattr(source, "chat_id", "") or "")
-    user_id = str(getattr(source, "user_id", "") or "")
-    if not allowed_chats.intersection((chat_id, user_id)):
-        return None
-
-    text = getattr(event, "text", "")
-    completion_item = _parse_completion_text(text)
-    if completion_item is not None:
-        if not completion_item:
-            _schedule_reply(gateway, event, "❓ 請告訴我要完成哪一項待辦。")
-            return {"action": "skip", "reason": "todo-direct-completion-missing-item"}
-        try:
-            completion_state, completed = _complete_notion_todo(completion_item)
-        except Exception:
-            logger.exception("Todo completion could not update Notion")
-            _schedule_reply(
-                gateway,
-                event,
-                "❌ 待辦尚未更新\n\n原因：暫時無法更新 Notion，請稍後再試。",
-            )
-            return {"action": "skip", "reason": "todo-direct-completion-failed"}
-
-        if completion_state == "completed" and completed is not None:
-            reply = _completion_success_reply(completed)
-        elif completion_state == "already_completed" and completed is not None:
-            reply = _completion_already_done_reply(completed)
-        elif completion_state == "ambiguous":
-            reply = _completion_ambiguous_reply(completion_item)
-        else:
-            reply = _completion_not_found_reply(completion_item)
-        _schedule_reply(gateway, event, reply)
-        return {"action": "skip", "reason": "todo-direct-completion"}
-
-    parsed = _parse_todo_text(text)
-    if parsed is None:
-        return None
-    item, due_date = parsed
-    if not item:
-        _schedule_reply(gateway, event, "❓ 請告訴我要記錄的待辦內容。")
-        return {"action": "skip", "reason": "todo-direct-ingest-missing-item"}
-
+def _create_todo(
+    item: str,
+    due_date: str | None,
+    for_who: str,
+    source_text: str,
+    source_event_id: str | None,
+) -> str:
     try:
         record, _ = _local_record(
             item=item,
             due_date=due_date,
-            for_who=DEFAULT_FOR_WHO,
-            note=None,
-            source_event_id=_source_event_id(event),
+            for_who=for_who,
+            note=source_text,
+            source_event_id=source_event_id,
         )
     except TodoDataError:
         logger.exception("Todo inbox validation or append failed")
-        _schedule_reply(
-            gateway,
-            event,
-            "❌ 待辦未記錄\n\n原因：Hermes 待辦資料需要修復，已停止寫入。",
-        )
-        return {"action": "skip", "reason": "todo-direct-ingest-local-failed"}
+        return _local_failure(item, "Hermes 待辦資料需要修復，已停止寫入。", "local_invalid")
     except Exception:
-        logger.exception("Deterministic todo local ingest failed")
-        _schedule_reply(
-            gateway,
-            event,
-            "❌ 待辦未記錄\n\n原因：Hermes 暫時無法儲存待辦，請稍後再試。",
-        )
-        return {"action": "skip", "reason": "todo-direct-ingest-local-failed"}
+        logger.exception("Todo local ingest failed")
+        return _local_failure(item, "Hermes 暫時無法儲存，請稍後再試。", "local_failed")
 
     try:
         _sync_to_notion(record)
-        reply = _success_reply(record)
     except Exception:
         logger.exception("Todo persisted locally but Notion sync failed")
-        reply = _notion_warning_reply(record)
+        return _notion_warning(
+            record,
+            "todo_created_local_only",
+            "待辦已保留在 Hermes；稍後重試不會重複建立。",
+        )
+    return _response(
+        "success",
+        "todo_created",
+        "待辦已記錄並同步到 Notion",
+        _success_data(record),
+        status="created",
+    )
 
-    _schedule_reply(gateway, event, reply)
-    return {"action": "skip", "reason": "todo-direct-ingest"}
+
+def _complete_todo(
+    requested_item: str,
+    source_text: str,
+    source_event_id: str | None,
+) -> str:
+    try:
+        _read_inbox()
+    except TodoDataError:
+        logger.exception("Todo inbox validation failed before completion")
+        return _local_failure(
+            requested_item, "Hermes 待辦資料需要修復，已停止寫入。", "local_invalid"
+        )
+
+    try:
+        pages = _query_all_todos()
+    except Exception:
+        logger.exception("Could not query Notion todos for completion")
+        try:
+            pending, _ = _local_completion_record(
+                requested_item, None, source_text, source_event_id
+            )
+        except Exception:
+            logger.exception("Could not retain pending todo completion")
+            return _local_failure(
+                requested_item, "Hermes 與 Notion 目前都無法更新，請稍後再試。", "completion_failed"
+            )
+        return _notion_warning(
+            pending,
+            "todo_completion_local_only",
+            "完成狀態已保留在 Hermes；稍後重試會繼續同步。",
+        )
+
+    open_match, open_score = _best_todo_match(requested_item, pages, done=False)
+    if open_match is not None and open_score >= MATCH_THRESHOLD:
+        try:
+            completion, _ = _local_completion_record(
+                requested_item, open_match, source_text, source_event_id
+            )
+        except Exception:
+            logger.exception("Could not append todo completion event")
+            return _local_failure(
+                requested_item, "Hermes 暫時無法保存完成狀態，未變更 Notion。", "local_failed"
+            )
+        try:
+            _complete_notion_page(open_match)
+        except Exception:
+            logger.exception("Todo completion retained locally but Notion update failed")
+            return _notion_warning(
+                completion,
+                "todo_completion_local_only",
+                "完成狀態已保留在 Hermes；稍後重試會繼續同步。",
+            )
+        return _response(
+            "success",
+            "todo_completed",
+            "待辦已完成並更新到 Notion",
+            _success_data(completion),
+            status="completed",
+        )
+
+    done_match, done_score = _best_todo_match(requested_item, pages, done=True)
+    if done_match is not None and done_score >= MATCH_THRESHOLD:
+        try:
+            completion, _ = _local_completion_record(
+                requested_item, done_match, source_text, source_event_id
+            )
+        except Exception:
+            logger.exception("Could not append already-completed todo event")
+            completion = done_match
+        return _response(
+            "success",
+            "todo_already_completed",
+            "待辦已是完成狀態",
+            _success_data(completion),
+            status="already_completed",
+        )
+
+    due_date = _derive_due_date(source_text)
+    try:
+        record, _ = _local_record(
+            item=requested_item,
+            due_date=due_date,
+            for_who=DEFAULT_FOR_WHO,
+            note=source_text,
+            source_event_id=source_event_id,
+            done=True,
+        )
+    except Exception:
+        logger.exception("Could not save unmatched completed todo")
+        return _local_failure(
+            requested_item, "Hermes 暫時無法保存完成紀錄，請稍後再試。", "local_failed"
+        )
+    try:
+        _sync_to_notion(record)
+    except Exception:
+        logger.exception("Completed todo saved locally but Notion creation failed")
+        return _notion_warning(
+            record,
+            "todo_completion_local_only",
+            "完成紀錄已保留在 Hermes；稍後重試會繼續同步。",
+        )
+    return _response(
+        "success",
+        "todo_completed_created",
+        "已建立完成紀錄並同步到 Notion",
+        _success_data(record),
+        status="completed_created",
+    )
+
+
+def _handle_todo_execute(args: dict[str, Any], **kwargs: Any) -> str:
+    session_id = str(kwargs.get("session_id") or "").strip()
+    context = _authorized_context(session_id)
+    if context is None:
+        logger.warning("Rejected todo_execute outside an authorized Telegram session")
+        return _local_failure("待辦", "這個工具只接受指定 Telegram 私聊的請求。", "unauthorized")
+
+    action = str(args.get("action") or "").strip().lower()
+    item = str(args.get("item") or "").strip().strip("「」『』\"'")
+    if action not in {"create", "complete"}:
+        return _local_failure(item or "待辦", "無法辨識新增或完成動作。", "invalid_action")
+    if not item:
+        return _local_failure("待辦", "缺少待辦項目。", "missing_item")
+    if len(item) > 200:
+        return _local_failure(item[:200], "待辦項目過長。", "invalid_item")
+
+    source_text = str(context.get("source_text") or args.get("source_text") or "").strip()
+    source_event_id = str(context.get("source_event_id") or "").strip() or None
+    if not source_text:
+        source_text = str(args.get("source_text") or item).strip()
+
+    if action == "complete":
+        return _complete_todo(item, source_text, source_event_id)
+
+    for_who = str(args.get("for_who") or DEFAULT_FOR_WHO).strip() or DEFAULT_FOR_WHO
+    try:
+        due_date = _validated_due_date(args.get("due_date"), source_text)
+    except ValueError:
+        return _local_failure(item, "期限格式無法辨識。", "invalid_due_date")
+    return _create_todo(item, due_date, for_who, source_text, source_event_id)
 
 
 def register(ctx: Any) -> None:
-    ctx.register_hook("pre_gateway_dispatch", _intercept_todo)
+    ctx.register_tool(
+        name=TOOL_NAME,
+        toolset=TOOLSET_NAME,
+        schema=TODO_EXECUTE_SCHEMA,
+        handler=_handle_todo_execute,
+        description=(
+            "Hermes interprets a natural Telegram todo, then this tool performs the only "
+            "allowed JSONL and Notion write."
+        ),
+        emoji="✅",
+    )
+    ctx.register_hook("pre_llm_call", _remember_telegram_session)
