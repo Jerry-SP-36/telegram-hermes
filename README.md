@@ -80,7 +80,9 @@ The n8n source template is
 It is a new webhook workflow, isolated from all Watch workflows. It validates a
 shared header, deduplicates by `report_id`, sends Gmail, and marks the report
 sent only after Gmail succeeds. The workflow must remain inactive until its
-shared secret, recipient, and Gmail OAuth2 credential are configured.
+shared secret, sender/recipient address, and Gmail SMTP App Password credential
+are configured. The SMTP credential uses `smtp.gmail.com`, port `465`, and
+SSL/TLS; its App Password must be entered directly in n8n and never committed.
 
 If n8n is unavailable, Telegram delivery continues and the canonical payload is
 retained once in `/opt/data/workspace/daily-review-delivery-outbox.jsonl` for a

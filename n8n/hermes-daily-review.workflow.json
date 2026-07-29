@@ -58,16 +58,18 @@
     },
     {
       "parameters": {
-        "sendTo": "REPLACE_WITH_GMAIL_ADDRESS",
+        "fromEmail": "REPLACE_WITH_GMAIL_ADDRESS",
+        "toEmail": "REPLACE_WITH_GMAIL_ADDRESS",
         "subject": "={{ $json.subject }}",
-        "message": "={{ $json.html }}",
+        "emailFormat": "html",
+        "html": "={{ $json.html }}",
         "options": {}
       },
-      "type": "n8n-nodes-base.gmail",
+      "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [-40, 160],
       "id": "5951fc54-f2f2-472b-858c-5cbb0119c717",
-      "name": "Send Gmail"
+      "name": "Send Gmail via SMTP"
     },
     {
       "parameters": {
@@ -105,7 +107,7 @@
     },
     {
       "parameters": {
-        "content": "## Activation gate\n\nThis new workflow is intentionally inactive until all three values are configured:\n\n1. Replace `REPLACE_WITH_SHARED_SECRET` in **Validate + Prepare**.\n2. Replace `REPLACE_WITH_GMAIL_ADDRESS` in **Send Gmail**.\n3. Connect a Gmail OAuth2 credential to **Send Gmail**.\n\nDo not reuse or modify either existing Watch workflow.",
+        "content": "## Activation gate\n\nThis new workflow is intentionally inactive until all three values are configured:\n\n1. Replace `REPLACE_WITH_SHARED_SECRET` in **Validate + Prepare**.\n2. Replace `REPLACE_WITH_GMAIL_ADDRESS` in **Send Gmail via SMTP**.\n3. Connect an SMTP credential using `smtp.gmail.com`, port `465`, SSL/TLS, the Gmail address, and a Google App Password.\n\nEnter the App Password directly in n8n; never put it in source code or chat.\n\nDo not reuse or modify either existing Watch workflow.",
         "height": 300,
         "width": 460,
         "color": 5
@@ -127,10 +129,10 @@
     "Already Sent?": {
       "main": [
         [{"node": "Respond Duplicate", "type": "main", "index": 0}],
-        [{"node": "Send Gmail", "type": "main", "index": 0}]
+        [{"node": "Send Gmail via SMTP", "type": "main", "index": 0}]
       ]
     },
-    "Send Gmail": {
+    "Send Gmail via SMTP": {
       "main": [[{"node": "Mark Report Sent", "type": "main", "index": 0}]]
     },
     "Mark Report Sent": {
