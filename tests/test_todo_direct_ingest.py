@@ -42,7 +42,7 @@ class FakeAdapter:
 class NotionStub:
     def __init__(self, fail: bool = False) -> None:
         self.fail = fail
-        self.items: set[str] = set()
+        self.items: set[tuple[str, str | None, str]] = set()
         self.created = 0
 
     def __call__(self, method: str, path: str, payload=None):
@@ -50,10 +50,29 @@ class NotionStub:
             raise RuntimeError("notion unavailable")
         if path.endswith("/query"):
             item = payload["filter"]["title"]["equals"]
-            return {"results": [{"id": "existing"}]} if item in self.items else {"results": []}
+            results = []
+            for stored_item, due_date, for_who in self.items:
+                if stored_item != item:
+                    continue
+                results.append(
+                    {
+                        "id": "existing",
+                        "properties": {
+                            "For Who": {"select": {"name": for_who}},
+                            "Due Date": {
+                                "date": None if due_date is None else {"start": due_date}
+                            },
+                        },
+                    }
+                )
+            return {"results": results}
         if path == "/v1/pages":
-            item = payload["properties"]["Item"]["title"][0]["text"]["content"]
-            self.items.add(item)
+            properties = payload["properties"]
+            item = properties["Item"]["title"][0]["text"]["content"]
+            due_property = properties.get("Due Date", {}).get("date")
+            due_date = due_property.get("start") if due_property else None
+            for_who = properties["For Who"]["select"]["name"]
+            self.items.add((item, due_date, for_who))
             self.created += 1
             return {"url": "https://www.notion.so/test"}
         raise AssertionError(path)
@@ -157,6 +176,30 @@ class TodoDirectIngestTests(unittest.TestCase):
         asyncio.run(self.run_hook("待辦：拿大頭照", notion, "101"))
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(notion.created, 1)
+
+    def test_same_item_with_different_due_date_is_not_a_duplicate(self) -> None:
+        notion = NotionStub()
+        first, first_added = todo._local_record(
+            "確認 Ansys 簡報",
+            "2026-07-30",
+            "Myself",
+            None,
+            "telegram:42:300",
+        )
+        second, second_added = todo._local_record(
+            "確認 Ansys 簡報",
+            "2026-07-31",
+            "Myself",
+            None,
+            "telegram:42:301",
+        )
+        with patch.object(todo, "_notion_request", side_effect=notion):
+            self.assertEqual(todo._sync_to_notion(first), "created")
+            self.assertEqual(todo._sync_to_notion(second), "created")
+        self.assertTrue(first_added)
+        self.assertTrue(second_added)
+        self.assertEqual(len(self.records()), 2)
+        self.assertEqual(notion.created, 2)
 
     def test_invalid_jsonl_fails_closed(self) -> None:
         todo.INBOX.write_text('{"broken"\n', encoding="utf-8")

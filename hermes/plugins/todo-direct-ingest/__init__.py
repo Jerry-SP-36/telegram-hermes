@@ -246,16 +246,56 @@ def _notion_request(method: str, path: str, payload: dict[str, Any] | None = Non
         raise RuntimeError(f"Notion API {error.code}: {message}") from error
 
 
-def _query_exact_item(item: str) -> list[dict[str, Any]]:
-    return _notion_request(
+def _notion_select_name(page: dict[str, Any], property_name: str) -> str | None:
+    properties = page.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    value = properties.get(property_name)
+    if not isinstance(value, dict):
+        return None
+    selected = value.get("select")
+    if not isinstance(selected, dict):
+        return None
+    name = selected.get("name")
+    return name if isinstance(name, str) else None
+
+
+def _notion_date_start(page: dict[str, Any], property_name: str) -> str | None:
+    properties = page.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    value = properties.get(property_name)
+    if not isinstance(value, dict):
+        return None
+    date_value = value.get("date")
+    if not isinstance(date_value, dict):
+        return None
+    start = date_value.get("start")
+    return start[:10] if isinstance(start, str) else None
+
+
+def _query_matching_todo(record: dict[str, Any]) -> bool:
+    results = _notion_request(
         "POST",
         f"/v1/data_sources/{DATA_SOURCE_ID}/query",
-        {"filter": {"property": "Item", "title": {"equals": item}}, "page_size": 10},
+        {
+            "filter": {
+                "property": "Item",
+                "title": {"equals": record["item"]},
+            },
+            "page_size": 100,
+        },
     ).get("results", [])
+    return any(
+        isinstance(page, dict)
+        and _notion_select_name(page, "For Who") == record["for_who"]
+        and _notion_date_start(page, "Due Date") == record.get("due_date")
+        for page in results
+    )
 
 
 def _sync_to_notion(record: dict[str, Any]) -> str:
-    if _query_exact_item(record["item"]):
+    if _query_matching_todo(record):
         return "already_exists"
     properties: dict[str, Any] = {
         "Item": {"title": [{"text": {"content": record["item"]}}]},
