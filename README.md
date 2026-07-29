@@ -33,6 +33,10 @@ Hermes `pre_gateway_dispatch` plugins. The canonical todo plugin is stored at
 validates and appends the Hermes todo JSONL, synchronizes Notion, sends a
 human-readable acknowledgement, and returns `skip` before the LLM runs. It is
 deployed to the Hermes service's persistent `/opt/data/plugins` directory.
+At startup, Zeabur copies only the Todo and Expense plugin files into Hermes's
+active `/opt/data/runtime/plugins` home. The Todo runtime directory is named
+`00-todo-direct-ingest` so Hermes registers its `pre_gateway_dispatch` hook
+before Expense without changing either plugin's manifest or business logic.
 
 This is deliberately separate from the response bridge. The bridge still owns
 only final-response rendering, while the existing `expense-direct-ingest`
