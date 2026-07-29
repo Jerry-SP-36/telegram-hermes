@@ -1,0 +1,150 @@
+{
+  "name": "Hermes Daily Review → Gmail",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "hermes-daily-review-v1",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-760, 80],
+      "id": "1289329a-ce2c-4dc5-a780-eb5b0b41d4fb",
+      "name": "Hermes Daily Review Webhook",
+      "webhookId": "c3fd1a02-f820-48ca-a1fc-dc3e26e039e0"
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $input.first().json;\nconst body = envelope.body ?? envelope;\nconst headers = envelope.headers ?? {};\nconst expectedKey = 'REPLACE_WITH_SHARED_SECRET';\nconst receivedKey = String(headers['x-hermes-daily-review-key'] ?? '');\nif (expectedKey === 'REPLACE_WITH_SHARED_SECRET' || receivedKey !== expectedKey) {\n  throw new Error('Unauthorized Hermes daily review');\n}\nif (body?.version !== '1.0' || typeof body.report_id !== 'string' || typeof body.date !== 'string') {\n  throw new Error('Invalid Hermes daily review payload');\n}\nif (!Array.isArray(body.todos) || !Array.isArray(body.sipi_ideas) || typeof body.telegram_text !== 'string') {\n  throw new Error('Incomplete Hermes daily review payload');\n}\nconst state = $getWorkflowStaticData('global');\nstate.sentReportIds ??= {};\nconst duplicate = Boolean(state.sentReportIds[body.report_id]);\nconst escapeHtml = (value) => String(value ?? '').replace(/[&<>\\\"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\\\"':'&quot;',\"'\":'&#39;'}[char]));\nconst todoRows = body.todos.length\n  ? body.todos.map((todo, index) => `<li>${index + 1}. ${escapeHtml(todo.item)}｜${escapeHtml(todo.due_date || '未指定')}</li>`).join('')\n  : '<li>目前沒有未完成待辦。</li>';\nconst ideaRows = body.sipi_ideas.length\n  ? body.sipi_ideas.map((idea, index) => `<li>${index + 1}. ${escapeHtml(idea.title)}</li>`).join('')\n  : '<li>目前沒有待消化的 SI/PI idea。</li>';\nconst html = `<h2>Hermes 每日盤點｜${escapeHtml(body.date)}</h2><h3>未完成待辦（${body.todos.length}）</h3><ol>${todoRows}</ol><h3>待消化 SI/PI idea（${body.sipi_ideas.length}）</h3><ol>${ideaRows}</ol>`;\nreturn [{json: {...body, duplicate, html}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, 80],
+      "id": "893bafae-b53b-4de1-8322-f128e1e5bc30",
+      "name": "Validate + Prepare"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "fec33f05-bce4-47b7-b181-cae3b0c23c04",
+              "leftValue": "={{ $json.duplicate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-280, 80],
+      "id": "2b8f1c99-670d-46c7-a8c0-2d86cd1efccd",
+      "name": "Already Sent?"
+    },
+    {
+      "parameters": {
+        "sendTo": "REPLACE_WITH_GMAIL_ADDRESS",
+        "subject": "={{ $json.subject }}",
+        "message": "={{ $json.html }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-40, 160],
+      "id": "5951fc54-f2f2-472b-858c-5cbb0119c717",
+      "name": "Send Gmail"
+    },
+    {
+      "parameters": {
+        "jsCode": "const prepared = $('Validate + Prepare').first().json;\nconst state = $getWorkflowStaticData('global');\nstate.sentReportIds ??= {};\nstate.sentReportIds[prepared.report_id] = new Date().toISOString();\nconst ids = Object.keys(state.sentReportIds).sort();\nfor (const id of ids.slice(0, Math.max(0, ids.length - 90))) delete state.sentReportIds[id];\nreturn [{json: {accepted: true, duplicate: false, report_id: prepared.report_id}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, 160],
+      "id": "8640708f-1620-4317-b800-410dd49ed1a6",
+      "name": "Mark Report Sent"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { accepted: true, duplicate: true, report_id: $json.report_id } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [200, 0],
+      "id": "4cd8bc71-68c7-4e39-991b-c58a298f655d",
+      "name": "Respond Duplicate"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [440, 160],
+      "id": "adbbac1d-cfe2-4ba0-a8a7-e000749ca936",
+      "name": "Respond Sent"
+    },
+    {
+      "parameters": {
+        "content": "## Activation gate\n\nThis new workflow is intentionally inactive until all three values are configured:\n\n1. Replace `REPLACE_WITH_SHARED_SECRET` in **Validate + Prepare**.\n2. Replace `REPLACE_WITH_GMAIL_ADDRESS` in **Send Gmail**.\n3. Connect a Gmail OAuth2 credential to **Send Gmail**.\n\nDo not reuse or modify either existing Watch workflow.",
+        "height": 300,
+        "width": 460,
+        "color": 5
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-760, -320],
+      "id": "c610f521-f4b1-48bd-9338-57be5d226d14",
+      "name": "Activation Gate"
+    }
+  ],
+  "connections": {
+    "Hermes Daily Review Webhook": {
+      "main": [[{"node": "Validate + Prepare", "type": "main", "index": 0}]]
+    },
+    "Validate + Prepare": {
+      "main": [[{"node": "Already Sent?", "type": "main", "index": 0}]]
+    },
+    "Already Sent?": {
+      "main": [
+        [{"node": "Respond Duplicate", "type": "main", "index": 0}],
+        [{"node": "Send Gmail", "type": "main", "index": 0}]
+      ]
+    },
+    "Send Gmail": {
+      "main": [[{"node": "Mark Report Sent", "type": "main", "index": 0}]]
+    },
+    "Mark Report Sent": {
+      "main": [[{"node": "Respond Sent", "type": "main", "index": 0}]]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "versionId": "c445f47e-2806-4fbb-bc91-b135ced4a2a9",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

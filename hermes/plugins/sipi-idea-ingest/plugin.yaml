@@ -1,0 +1,3 @@
+name: sipi-idea-ingest
+version: "1.0.0"
+description: Lets Hermes shorten and track Telegram SI/PI ideas in an append-only local inbox.

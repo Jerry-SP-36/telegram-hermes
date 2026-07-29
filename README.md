@@ -47,6 +47,46 @@ This is deliberately separate from the response bridge. The bridge still owns
 only final-response rendering, while the existing `expense-direct-ingest`
 plugin and the single built-in Telegram poller remain unchanged.
 
+### SI/PI idea plugin
+
+[`hermes/plugins/sipi-idea-ingest`](hermes/plugins/sipi-idea-ingest) is an
+additive native plugin. It gives Hermes one `sipi_idea_execute` tool so the LLM
+can shorten an explicitly requested SI/PI idea, while the executor performs the
+only append-only write to `/opt/data/workspace/sipi-idea-inbox.jsonl`.
+
+- `create` stores the concise title, optional summary, original Telegram text,
+  source event id, and `pending` state.
+- `consume` appends a `consumed` status event for the single best pending match;
+  it does not ask the user to choose candidates.
+- The plugin never reads or writes Notion. Todo and Expense routing rules keep
+  precedence for actionable work and expenses.
+- Deployment uses new persistent and runtime directories. It does not add the
+  plugin to the shared Todo/Expense copy list in `/opt/telegram_bridge_init.py`.
+
+### 21:00 daily review
+
+[`hermes/scripts/daily_review.py`](hermes/scripts/daily_review.py) is a
+deterministic no-agent cron script. It queries unfinished Notion todos, reads
+pending SI/PI ideas, posts one canonical payload to n8n, and prints the same
+human-readable report for Hermes's Telegram delivery.
+
+Every todo line contains only `item｜due_date`; the SI/PI section contains only
+the still-pending titles. Hermes's Telegram adapter owns the 4,096-character
+delivery boundary and splits an oversized report without creating another
+poller. The intended schedule is `0 21 * * *` in `Asia/Taipei`.
+
+The n8n source template is
+[`n8n/hermes-daily-review.workflow.json`](n8n/hermes-daily-review.workflow.json).
+It is a new webhook workflow, isolated from all Watch workflows. It validates a
+shared header, deduplicates by `report_id`, sends Gmail, and marks the report
+sent only after Gmail succeeds. The workflow must remain inactive until its
+shared secret, recipient, and Gmail OAuth2 credential are configured.
+
+If n8n is unavailable, Telegram delivery continues and the canonical payload is
+retained once in `/opt/data/workspace/daily-review-delivery-outbox.jsonl` for a
+later retry. The existing morning-focus, Todo-sync, and end-of-day cron jobs are
+not modified by this feature.
+
 ### Telegram 待辦語意
 
 - 自然語句可直接新增，例如 `今天要詢問歐美亞有關護照申辦的事情`；Hermes 會整理成短項目與期限，不需要再輸入固定前綴。
