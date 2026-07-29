@@ -25,6 +25,19 @@ last Telegram-sender step.
 The bridge has no database, queue, state machine, callback routing, or
 confidence-based routing.
 
+## Deterministic Hermes write plugins
+
+Business writes that must succeed independently of the LLM belong in native
+Hermes `pre_gateway_dispatch` plugins. The canonical todo plugin is stored at
+[`hermes/plugins/todo-direct-ingest`](hermes/plugins/todo-direct-ingest): it
+validates and appends the Hermes todo JSONL, synchronizes Notion, sends a
+human-readable acknowledgement, and returns `skip` before the LLM runs. It is
+deployed to the Hermes service's persistent `/opt/data/plugins` directory.
+
+This is deliberately separate from the response bridge. The bridge still owns
+only final-response rendering, while the existing `expense-direct-ingest`
+plugin and the single built-in Telegram poller remain unchanged.
+
 ## Local verification
 
 ```sh

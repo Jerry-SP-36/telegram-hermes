@@ -1,0 +1,5 @@
+name: todo-direct-ingest
+version: "1.0.0"
+description: Deterministically records Telegram todo messages before the LLM runs.
+requires_env:
+  - NOTION_API_KEY
